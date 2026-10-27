@@ -689,7 +689,6 @@ module hart #(
     );
 
     // pipeline state updates
-
     always @(posedge i_clk) begin
         if (i_rst) begin
             pc          <= RESET_ADDR;
