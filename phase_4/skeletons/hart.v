@@ -143,33 +143,26 @@ module hart #(
 `endif
 );
 
-    // Your implementation goes under here
-
+    //Default NOP instruction word
     localparam [31:0] NOP = 32'h00000013;
 
-    //
     // IF stage
-    //
 
     // PC Register and fetching
     reg  [31:0] pc; // program counter
-    reg         stop_fetch;
+    reg         stop_fetch; //flag to freeze PC fetch
     wire [31:0] pc_plus4; // address of next instruction
 
     assign pc_plus4     = pc + 32'd4;
     assign o_imem_raddr = pc; // instruction memory address
 
-    //
     // IF/ID pipeline registers
-    //
 
     reg         ifid_valid;
     reg  [31:0] ifid_inst;
     reg  [31:0] ifid_pc;
 
-    //
     // ID stage: decoder and register file
-    //
 
     wire        dec_legal; // high if instruction encoding is valid
     wire        dec_halt; // high if decoder requests a halt
@@ -287,9 +280,7 @@ module hart #(
         .i_rd_wdata  (memwb_rd_wdata)
     );
 
-    //
     // ID/EX pipeline registers
-    //
 
     reg         idex_valid;
     reg  [31:0] idex_inst;
@@ -327,9 +318,7 @@ module hart #(
     reg         idex_dmem_memu;
     reg  [3:0]  idex_rd_sel;
 
-    //
     // EX/MEM pipeline registers
-    //
 
     reg         exmem_valid;
     reg  [31:0] exmem_inst;
@@ -359,9 +348,7 @@ module hart #(
     reg         exmem_dmem_memu;
 
 
-    //
     // EX stage: forwarding and ALU
-    //
 
     wire [31:0] mem_load_data;
     wire [31:0] mem_wb_value;
@@ -372,6 +359,7 @@ module hart #(
     wire exmem_can_forward;
     wire memwb_can_forward;
 
+    //Check if EX/MEM or MEM/WB stages hold valid results for forwarding
     assign exmem_can_forward =
         exmem_valid && exmem_regwrite && !exmem_trap &&
         (exmem_rd_addr != 5'd0);
@@ -380,6 +368,7 @@ module hart #(
         memwb_valid && memwb_regwrite &&
         (memwb_rd_waddr != 5'd0);
 
+    //Forwarding MUXes: priority given to EX/MEM stage over MEM/WB stage
     assign ex_rs1_forward =
         (FWD_EN && exmem_can_forward && (exmem_rd_addr == idex_rs1_addr))
             ? mem_wb_value
@@ -401,6 +390,7 @@ module hart #(
     wire        ex_alu_slt;
     wire        ex_alu_sltu;
 
+    //Select ALU inputs based on decoder control signals
     assign ex_alu_op1 = idex_op1_sel ? idex_pc : ex_rs1_forward;
     assign ex_alu_op2 = idex_op2_sel ? idex_imm : ex_rs2_forward;
 
@@ -430,6 +420,7 @@ module hart #(
     wire        ex_control_flush;
     wire [31:0] ex_next_pc;
 
+    //Evaluate branch conditions using ALU comparison outputs
     assign ex_branch_compare =
         idex_branch_equal
             ? ex_alu_eq
@@ -441,6 +432,7 @@ module hart #(
         idex_valid && idex_branch &&
         (idex_branch_invert ? !ex_branch_compare : ex_branch_compare);
 
+    //Calculate branch and jump target addresses
     assign ex_branch_target = idex_pc + idex_imm;
     assign ex_jalr_target   = {ex_alu_result[31:1], 1'b0};
 
@@ -450,6 +442,7 @@ module hart #(
     assign ex_control_target =
         (idex_jump && idex_pc_sel) ? ex_jalr_target : ex_branch_target;
 
+    //Detect unaligned memory accesses and PC targets
     assign ex_data_misaligned =
         (idex_dmem_ren || idex_dmem_wen) &&
         ((idex_dmem_memh && ex_alu_result[0]) ||
@@ -462,13 +455,12 @@ module hart #(
         idex_valid &&
         (!idex_legal || ex_data_misaligned || ex_inst_misaligned);
 
+    //Redirect PC and flush IF/ID stages when control flow changes
     assign ex_redirect = ex_control_taken && !ex_trap;
     assign ex_control_flush = idex_valid && ex_control_taken;
     assign ex_next_pc = ex_redirect ? ex_control_target : idex_pc4;
 
-    //
     // MEM stage: data-memory interface and writeback-value selection
-    //
 
     wire [1:0]  mem_addr_lsbs;
     wire [3:0]  mem_access_mask;
@@ -477,24 +469,28 @@ module hart #(
 
     assign mem_addr_lsbs = exmem_alu_result[1:0];
 
+    //Build byte mask for byte, half-word, and word memory operations
     assign mem_access_mask =
         exmem_dmem_memb ? 4'b0001 :
         exmem_dmem_memh ? 4'b0011 :
         exmem_dmem_memw ? 4'b1111 :
                           4'b0000;
 
+    //Align byte mask according to the address LSBs
     assign mem_shifted_mask =
         (mem_addr_lsbs == 2'b00) ? mem_access_mask :
         (mem_addr_lsbs == 2'b01) ? {mem_access_mask[2:0], 1'b0} :
         (mem_addr_lsbs == 2'b10) ? {mem_access_mask[1:0], 2'b00} :
                                    {mem_access_mask[0], 3'b000};
 
+    //Assign loaded word from memory
     assign mem_load_shifted =
         (mem_addr_lsbs == 2'b00) ? i_dmem_rdata :
         (mem_addr_lsbs == 2'b01) ? (i_dmem_rdata >> 8) :
         (mem_addr_lsbs == 2'b10) ? (i_dmem_rdata >> 16) :
                                    (i_dmem_rdata >> 24);
 
+    //Sign/zero extended byte or half word load data
     assign mem_load_data =
         exmem_dmem_memb
             ? (exmem_dmem_memu
@@ -506,6 +502,7 @@ module hart #(
                 : {{16{mem_load_shifted[15]}}, mem_load_shifted[15:0]})
         : mem_load_shifted;
 
+    //MUX to select writeback value
     assign mem_wb_value =
         exmem_rd_sel[0] ? exmem_alu_result :
         exmem_rd_sel[1] ? exmem_imm :
@@ -534,15 +531,14 @@ module hart #(
     assign o_dmem_mask =
         (o_dmem_ren || o_dmem_wen) ? mem_shifted_mask : 4'b0000;
 
+    //Align store data to the target byte lane in data memory
     assign o_dmem_wdata =
         (mem_addr_lsbs == 2'b00) ? mem_store_data_final :
         (mem_addr_lsbs == 2'b01) ? (mem_store_data_final << 8) :
         (mem_addr_lsbs == 2'b10) ? (mem_store_data_final << 16) :
                                    (mem_store_data_final << 24);
 
-    //
     // MEM/WB pipeline registers
-    //
 
     reg  [31:0] memwb_inst;
     reg  [31:0] memwb_pc;
@@ -562,9 +558,7 @@ module hart #(
     reg  [31:0] memwb_dmem_wdata;
     reg  [31:0] memwb_dmem_rdata;
 
-    //
     // hazard detection
-    //
 
     wire hazard_idex_rs1;
     wire hazard_idex_rs2;
@@ -577,6 +571,7 @@ module hart #(
     wire hazard_memwb;
     wire pipeline_stall;
 
+    //detect hazards when ID instruction reads a register being written by later stages
     assign hazard_idex_rs1 =
         ifid_valid && idex_valid && idex_legal &&
         (idex_rd_addr != 5'd0) && (id_rs1_addr != 5'd0) &&
@@ -613,13 +608,12 @@ module hart #(
 
     assign hazard_memwb = hazard_memwb_rs1 || hazard_memwb_rs2;
 
+    //Force a pipeline stall when forwarding is disabled and hazards are detected
     assign pipeline_stall =
         !FWD_EN &&
         (hazard_idex || hazard_exmem || ((!BYPASS_EN) && hazard_memwb));
 
-    //
     // pipeline state updates
-    //
 
     always @(posedge i_clk) begin
         if (i_rst) begin
@@ -802,10 +796,9 @@ module hart #(
         end
     end
 
-    //
     // retire interface
-    //
 
+    //Assign writeback stage signals directly to the retirement tracking interface
     assign o_retire_valid = memwb_valid;
     assign o_retire_inst  = memwb_inst;
     assign o_retire_trap  = memwb_valid && memwb_trap;
