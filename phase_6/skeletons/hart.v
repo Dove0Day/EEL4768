@@ -773,6 +773,24 @@ module hart #(
         (dec_mext || dec_fpu) &&
         ((id_rs1_addr == idex_rd_addr) || (id_rs2_addr == idex_rd_addr));
 
+    // The iterative ALU must return to IDLE before another RV32M
+    // instruction enters EX. In S_DONE the old result is valid and o_busy is
+    // low, but a new M instruction presented in that same cycle has not begun.
+    // Insert one bubble between adjacent M instructions so the ALU can consume
+    // i_advance and return to S_IDLE before the next operation reaches EX.
+    wire mext_serial_hazard;
+    assign mext_serial_hazard =
+        ifid_valid && dec_mext &&
+        idex_valid && idex_mext;
+
+    // An M instruction that consumes an older integer result must also wait
+    // when that result is not yet safely available at its EX operand inputs.
+    wire mext_operand_hazard;
+    assign mext_operand_hazard =
+        ifid_valid && dec_mext &&
+        (hazard_idex || hazard_exmem ||
+         ((!BYPASS_EN) && hazard_memwb));
+
     //Force a pipeline stall when forwarding is disabled and hazards are detected
     // (without rf bypass, a register being written in WB must also be waited
     // on, even with forwarding on)
@@ -780,7 +798,8 @@ module hart #(
         (!FWD_EN && (hazard_idex || hazard_exmem)) ||
         ((!BYPASS_EN) && hazard_memwb) ||
         fp_hazard_idex || fp_hazard_exmem || fp_hazard_memwb ||
-        load_use_hazard;
+        load_use_hazard ||
+        mext_serial_hazard || mext_operand_hazard;
 
     // phase 5: instruction cache, data cache and stall logic
 

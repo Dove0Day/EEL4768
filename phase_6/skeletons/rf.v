@@ -9,11 +9,6 @@
 // NOTE: This can be implemented either by silently discarding writesto
 // address 5'd0, or by muxing the output to zero when reading from that
 // address.
-//
-// Phase 6: the same module also holds the 32 floating-point registers
-// f0-f31, with three read ports (the fused multiply-add instructions read
-// rs3) and a write port with an explicit write enable. Unlike x0, f0 is an
-// ordinary register, so address 5'd0 cannot mean "no write" there.
 module rf #(
     // When this parameter is set to 1, "RF bypass" mode is enabled. This
     // allows data at the write port to be observed at the read ports
@@ -48,27 +43,91 @@ module rf #(
     // at the next clock edge. When the writen enable is low, the register
     // file should remain unchanged at the clock edge.
     //
-    // Write register enable, address [0, 31] and input data.
+    // Write register address [0, 31] and input data.
     input  wire [ 4:0] i_rd_waddr,
     input  wire [31:0] i_rd_wdata,
-    // Floating-point read ports 1-3, with input address [0, 31] and output
-    // data. All three are asynchronous and independent, like the integer
-    // ports. f0 is an ordinary register.
+    // Floating-point registers.
     input  wire [ 4:0] i_frs1_raddr,
     output wire [31:0] o_frs1_rdata,
     input  wire [ 4:0] i_frs2_raddr,
     output wire [31:0] o_frs2_rdata,
     input  wire [ 4:0] i_frs3_raddr,
     output wire [31:0] o_frs3_rdata,
-    // Floating-point write port: synchronous, written at the next clock edge
-    // when the write enable is high (any address, f0 included).
     input  wire        i_frd_wen,
     input  wire [ 4:0] i_frd_waddr,
     input  wire [31:0] i_frd_wdata
 );
+    // 32 integer registers and 32 floating-point registers, 32 bits wide.
+    reg [31:0] registers [31:0];
+    reg [31:0] fp_registers [31:0];
 
-// Write your code here.
+    // Synchronous write & reset logic.
+    genvar g;
+    generate
+        for (g = 0; g < 32; g = g + 1) begin : reg_gen
+            always @(posedge i_clk) begin
+                if (i_rst) begin
+                    registers[g] <= 32'b0;
+                    fp_registers[g] <= 32'b0;
+                end else begin
+                    // Integer address zero means no integer write; x0 remains 0.
+                    if ((g != 0) && (i_rd_waddr == g))
+                        registers[g] <= i_rd_wdata;
+                    // f0 is writable, so FP writes use the explicit enable.
+                    if (i_frd_wen && (i_frd_waddr == g))
+                        fp_registers[g] <= i_frd_wdata;
+                end
+            end
+        end
+    endgenerate
 
+    // Combinational integer read logic with x0 hardwired to zero
+    wire [31:0] rs1_raw_data;
+    wire [31:0] rs2_raw_data;
+    assign rs1_raw_data = (i_rs1_raddr == 5'd0)
+                        ? 32'h0000_0000
+                        : registers[i_rs1_raddr];
+    assign rs2_raw_data = (i_rs2_raddr == 5'd0)
+                        ? 32'h0000_0000
+                        : registers[i_rs2_raddr];
+
+    // Combinational floating-point reads
+    // f0 is an ordinary register.
+    wire [31:0] frs1_raw_data;
+    wire [31:0] frs2_raw_data;
+    wire [31:0] frs3_raw_data;
+    assign frs1_raw_data = fp_registers[i_frs1_raddr];
+    assign frs2_raw_data = fp_registers[i_frs2_raddr];
+    assign frs3_raw_data = fp_registers[i_frs3_raddr];
+
+    // Optional integer bypass logic (active when BYPASS_EN = 1)
+    wire bypass_rs1;
+    wire bypass_rs2;
+    assign bypass_rs1 = (BYPASS_EN != 0)
+                      && (i_rd_waddr != 5'd0)
+                      && (i_rs1_raddr == i_rd_waddr);
+    assign bypass_rs2 = (BYPASS_EN != 0)
+                      && (i_rd_waddr != 5'd0)
+                      && (i_rs2_raddr == i_rd_waddr);
+    assign o_rs1_rdata = bypass_rs1 ? i_rd_wdata : rs1_raw_data;
+    assign o_rs2_rdata = bypass_rs2 ? i_rd_wdata : rs2_raw_data;
+
+    // Optional floating-point bypass logic
+    // Address zero is valid for f0.
+    wire bypass_frs1;
+    wire bypass_frs2;
+    wire bypass_frs3;
+    assign bypass_frs1 = (BYPASS_EN != 0)
+                       && i_frd_wen
+                       && (i_frs1_raddr == i_frd_waddr);
+    assign bypass_frs2 = (BYPASS_EN != 0)
+                       && i_frd_wen
+                       && (i_frs2_raddr == i_frd_waddr);
+    assign bypass_frs3 = (BYPASS_EN != 0)
+                       && i_frd_wen
+                       && (i_frs3_raddr == i_frd_waddr);
+    assign o_frs1_rdata = bypass_frs1 ? i_frd_wdata : frs1_raw_data;
+    assign o_frs2_rdata = bypass_frs2 ? i_frd_wdata : frs2_raw_data;
+    assign o_frs3_rdata = bypass_frs3 ? i_frd_wdata : frs3_raw_data;
 endmodule
-
 `default_nettype wire
