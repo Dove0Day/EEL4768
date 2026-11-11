@@ -109,16 +109,13 @@ module decoder (
     // rather than directly to the PC + immediate. This is used for JALR.
     output wire        o_pc_sel
 );
-
 // Write your code here.
     wire [6:0] opcode;
     wire [2:0] funct3;
     wire [6:0] funct7;
-
     wire [4:0] rs1;
     wire [4:0] rs2;
     wire [4:0] rd;
-
     // Extract instruction fields
     // R-type: funct3, funct7 -> operation
     // I (default): funct3 -> operation, funct7 -> shift variant
@@ -130,138 +127,75 @@ module decoder (
     assign rs1    = i_inst[19:15];
     assign rs2    = i_inst[24:20];
     assign funct7 = i_inst[31:25];
-
     //Extra Instruction Fields
-    Extra instruction fields for R4 (fused FP) and CSRs
-    wire [ 4:0] rs3      = i_inst[31:27];
-    wire [ 1:0] fmt      = i_inst[26:25];
-    wire [11:0] csr_addr = i_inst[31:20];
+    // Extra instruction fields for R4 (fused FP) and CSRs
+    wire [ 4:0] rs3;
+    wire [ 1:0] fmt;
+    wire [11:0] csr_addr;
+    assign rs3 = i_inst[31:27];
+    assign fmt = i_inst[26:25];
+    assign csr_addr = i_inst[31:20];
 
     // opcodes
-    localparam [6:0] OPC_LOAD   = 7'b0000011;
-    localparam [6:0] OPC_OPIMM  = 7'b0010011;
-    localparam [6:0] OPC_AUIPC  = 7'b0010111;
-    localparam [6:0] OPC_STORE  = 7'b0100011;
-    localparam [6:0] OPC_OP     = 7'b0110011;
-    localparam [6:0] OPC_LUI    = 7'b0110111;
-    localparam [6:0] OPC_BRANCH = 7'b1100011;
-    localparam [6:0] OPC_JALR   = 7'b1100111;
-    localparam [6:0] OPC_JAL    = 7'b1101111;
-    localparam [6:0] OPC_SYSTEM = 7'b1110011;
-
-    //Floating-point opcodes (Phse 6 Section 4.2)
+    localparam [6:0] OPC_LOAD     = 7'b0000011;
     localparam [6:0] OPC_LOAD_FP  = 7'b0000111;
+    localparam [6:0] OPC_OPIMM    = 7'b0010011;
+    localparam [6:0] OPC_AUIPC    = 7'b0010111;
+    localparam [6:0] OPC_STORE    = 7'b0100011;
     localparam [6:0] OPC_STORE_FP = 7'b0100111;
+    localparam [6:0] OPC_OP       = 7'b0110011;
+    localparam [6:0] OPC_LUI      = 7'b0110111;
     localparam [6:0] OPC_MADD     = 7'b1000011;
     localparam [6:0] OPC_MSUB     = 7'b1000111;
     localparam [6:0] OPC_NMSUB    = 7'b1001011;
     localparam [6:0] OPC_NMADD    = 7'b1001111;
     localparam [6:0] OPC_OP_FP    = 7'b1010011;
+    localparam [6:0] OPC_BRANCH   = 7'b1100011;
+    localparam [6:0] OPC_JALR     = 7'b1100111;
+    localparam [6:0] OPC_JAL      = 7'b1101111;
+    localparam [6:0] OPC_SYSTEM   = 7'b1110011;
 
     // Legality checks
-
-    // R
-    // default: funct7 -> 0000000
-    // sub, sra:       -> 0100000
     wire valid_op;
-    assign valid_op =
-        (opcode == OPC_OP) &&
-        (
-            ((funct7 == 7'b0000000) &&
-             ((funct3 == 3'b000) ||
-              (funct3 == 3'b001) ||
-              (funct3 == 3'b010) ||
-              (funct3 == 3'b011) ||
-              (funct3 == 3'b100) ||
-              (funct3 == 3'b101) ||
-              (funct3 == 3'b110) ||
-              (funct3 == 3'b111))) ||
-            ((funct7 == 7'b0100000) &&
-             ((funct3 == 3'b000) ||
-              (funct3 == 3'b101)))
-        );
-
-    // I (default)
-    // Only shift-immediate restrict funct7
-    // slli, srli: funct7 -> 0000000
-    // srai:              -> 0100000
     wire valid_opimm;
-    assign valid_opimm =
-        (opcode == OPC_OPIMM) &&
-        (
-            (funct3 == 3'b000) || // ADDI
-            (funct3 == 3'b010) || // SLTI
-            (funct3 == 3'b011) || // SLTIU
-            (funct3 == 3'b100) || // XORI
-            (funct3 == 3'b110) || // ORI
-            (funct3 == 3'b111) || // ANDI
-            ((funct3 == 3'b001) &&
-             (funct7 == 7'b0000000)) || // SLLI
-            ((funct3 == 3'b101) &&
-             ((funct7 == 7'b0000000) ||
-              (funct7 == 7'b0100000)))   // SRLI/SRAI
-        );
-
-    // I (load)
-    // lb: funct3 -> 000
-    // lh:           001
-    // lw:           010
-    // lbu:          100
-    // lhu:          101
     wire valid_load;
-    assign valid_load =
-        (opcode == OPC_LOAD) &&
-        (
-            (funct3 == 3'b000) ||
-            (funct3 == 3'b001) ||
-            (funct3 == 3'b010) ||
-            (funct3 == 3'b100) ||
-            (funct3 == 3'b101)
-        );
-
-    // S
-    // sb: funct3 -> 000
-    // sh:           001
-    // sw:           010
     wire valid_store;
-    assign valid_store =
-        (opcode == OPC_STORE) &&
-        (
-            (funct3 == 3'b000) ||
-            (funct3 == 3'b001) ||
-            (funct3 == 3'b010)
-        );
-
-    // B 
-    // beq, bne, blt, bge, bltu, bgeu
     wire valid_branch;
-    assign valid_branch =
-        (opcode == OPC_BRANCH) &&
-        (
-            (funct3 == 3'b000) ||
-            (funct3 == 3'b001) ||
-            (funct3 == 3'b100) ||
-            (funct3 == 3'b101) ||
-            (funct3 == 3'b110) ||
-            (funct3 == 3'b111)
-        );
-
     wire valid_jalr;
-    assign valid_jalr =
-        (opcode == OPC_JALR) &&
-        (funct3 == 3'b000);
-
     wire valid_jal;
-    assign valid_jal = (opcode == OPC_JAL);
-
     wire valid_lui;
-    assign valid_lui = (opcode == OPC_LUI);
-
     wire valid_auipc;
-    assign valid_auipc = (opcode == OPC_AUIPC);
-
     wire valid_ebreak;
-    assign valid_ebreak = (i_inst == 32'h00100073);
+    assign valid_op = (opcode == OPC_OP) &&
+        (((funct7 == 7'b0000000) &&
+          ((funct3 == 3'b000) || (funct3 == 3'b001) ||
+           (funct3 == 3'b010) || (funct3 == 3'b011) ||
+           (funct3 == 3'b100) || (funct3 == 3'b101) ||
+           (funct3 == 3'b110) || (funct3 == 3'b111))) ||
+         ((funct7 == 7'b0100000) &&
+          ((funct3 == 3'b000) || (funct3 == 3'b101))));
+    assign valid_opimm = (opcode == OPC_OPIMM) &&
+        ((funct3 == 3'b000) || (funct3 == 3'b010) ||
+         (funct3 == 3'b011) || (funct3 == 3'b100) ||
+         (funct3 == 3'b110) || (funct3 == 3'b111) ||
+         ((funct3 == 3'b001) && (funct7 == 7'b0000000)) ||
+         ((funct3 == 3'b101) &&
+          ((funct7 == 7'b0000000) || (funct7 == 7'b0100000))));
+    assign valid_load = (opcode == OPC_LOAD) &&
+        ((funct3 == 3'b000) || (funct3 == 3'b001) ||
+         (funct3 == 3'b010) || (funct3 == 3'b100) ||
+         (funct3 == 3'b101));
+    assign valid_store = (opcode == OPC_STORE) &&
+        ((funct3 == 3'b000) || (funct3 == 3'b001) || (funct3 == 3'b010));
+    assign valid_branch = (opcode == OPC_BRANCH) &&
+        ((funct3 == 3'b000) || (funct3 == 3'b001) ||
+         (funct3 == 3'b100) || (funct3 == 3'b101) ||
+         (funct3 == 3'b110) || (funct3 == 3'b111));
+    assign valid_jalr = (opcode == OPC_JALR) && (funct3 == 3'b000);
+    assign valid_jal = (opcode == OPC_JAL);
+    assign valid_lui = (opcode == OPC_LUI);
+    assign valid_auipc = (opcode == OPC_AUIPC);
+    assign valid_ebreak = (i_inst == 32'h0010_0073);
 
     // RV32M: OP with funct7 == 0000001 (any funct3)
     wire valid_mext;
@@ -273,284 +207,143 @@ module decoder (
 
     // FLW and FSW: only funct3 == 010
     wire valid_flw;
-    assign valid_flw = (opcode == OPC_LOAD_FP) && (funct3 == 3'b010);
-
     wire valid_fsw;
+    assign valid_flw = (opcode == OPC_LOAD_FP) && (funct3 == 3'b010);
     assign valid_fsw = (opcode == OPC_STORE_FP) && (funct3 == 3'b010);
 
     // Fused multiply-add (R4): fmt must be 00, rm must be valid
     wire valid_fused;
     assign valid_fused =
-        ((opcode == OPC_MADD)  ||
-         (opcode == OPC_MSUB)  ||
-         (opcode == OPC_NMSUB) ||
-         (opcode == OPC_NMADD)) &&
-        (fmt == 2'b00) &&
-        valid_rm;
+        ((opcode == OPC_MADD) || (opcode == OPC_MSUB) ||
+         (opcode == OPC_NMSUB) || (opcode == OPC_NMADD)) &&
+        (fmt == 2'b00) && valid_rm;
 
-    // OP-FP instructions (Section 4.7)
-    wire fp_arith_2src = (opcode == OPC_OP_FP) &&
-                         ((funct7 == 7'b0000000) || (funct7 == 7'b0000100) ||
-                          (funct7 == 7'b0001000) || (funct7 == 7'b0001100)) &&
-                         valid_rm;                                              // fadd/fsub/fmul/fdiv
-    wire fp_sqrt       = (opcode == OPC_OP_FP) && (funct7 == 7'b0101100) &&
-                         (rs2 == 5'b00000) && valid_rm;                         // fsqrt.s
-    wire fp_sgnj       = (opcode == OPC_OP_FP) && (funct7 == 7'b0010000) &&
-                         ((funct3 == 3'b000) || (funct3 == 3'b001) || (funct3 == 3'b010)); // fsgnj*
-    wire fp_minmax     = (opcode == OPC_OP_FP) && (funct7 == 7'b0010100) &&
-                         ((funct3 == 3'b000) || (funct3 == 3'b001));            // fmin.s/fmax.s
-    wire fp_cmp        = (opcode == OPC_OP_FP) && (funct7 == 7'b1010000) &&
-                         ((funct3 == 3'b000) || (funct3 == 3'b001) || (funct3 == 3'b010)); // feq/flt/fle
-    wire fp_class_mvxw = (opcode == OPC_OP_FP) && (funct7 == 7'b1110000) &&
-                         (rs2 == 5'b00000) && ((funct3 == 3'b000) || (funct3 == 3'b001));  // fmv.x.w/fclass.s
-    wire fp_cvt_w_s    = (opcode == OPC_OP_FP) && (funct7 == 7'b1100000) &&
-                         ((rs2 == 5'b00000) || (rs2 == 5'b00001)) && valid_rm;  // fcvt.w[u].s
-    wire fp_cvt_s_w    = (opcode == OPC_OP_FP) && (funct7 == 7'b1101000) &&
-                         ((rs2 == 5'b00000) || (rs2 == 5'b00001)) && valid_rm;  // fcvt.s.w[u]
-    wire fp_mvwx       = (opcode == OPC_OP_FP) && (funct7 == 7'b1111000) &&
-                         (rs2 == 5'b00000) && (funct3 == 3'b000);               // fmv.w.x
-
+    // OP-FP instructions
+    wire fp_arith_2src;
+    wire fp_sqrt;
+    wire fp_sgnj;
+    wire fp_minmax;
+    wire fp_cmp;
+    wire fp_class_mvxw;
+    wire fp_cvt_w_s;
+    wire fp_cvt_s_w;
+    wire fp_mvwx;
     wire valid_op_fp;
-    assign valid_op_fp =
-        fp_arith_2src || fp_sqrt || fp_sgnj || fp_minmax || fp_cmp ||
-        fp_class_mvxw || fp_cvt_w_s || fp_cvt_s_w || fp_mvwx;
+    assign fp_arith_2src = (opcode == OPC_OP_FP) &&
+        ((funct7 == 7'b0000000) || (funct7 == 7'b0000100) ||
+         (funct7 == 7'b0001000) || (funct7 == 7'b0001100)) && valid_rm;
+    assign fp_sqrt = (opcode == OPC_OP_FP) && (funct7 == 7'b0101100) &&
+        (rs2 == 5'b00000) && valid_rm;
+    assign fp_sgnj = (opcode == OPC_OP_FP) && (funct7 == 7'b0010000) &&
+        ((funct3 == 3'b000) || (funct3 == 3'b001) || (funct3 == 3'b010));
+    assign fp_minmax = (opcode == OPC_OP_FP) && (funct7 == 7'b0010100) &&
+        ((funct3 == 3'b000) || (funct3 == 3'b001));
+    assign fp_cmp = (opcode == OPC_OP_FP) && (funct7 == 7'b1010000) &&
+        ((funct3 == 3'b000) || (funct3 == 3'b001) || (funct3 == 3'b010));
+    assign fp_class_mvxw = (opcode == OPC_OP_FP) && (funct7 == 7'b1110000) &&
+        (rs2 == 5'b00000) && ((funct3 == 3'b000) || (funct3 == 3'b001));
+    assign fp_cvt_w_s = (opcode == OPC_OP_FP) && (funct7 == 7'b1100000) &&
+        ((rs2 == 5'b00000) || (rs2 == 5'b00001)) && valid_rm;
+    assign fp_cvt_s_w = (opcode == OPC_OP_FP) && (funct7 == 7'b1101000) &&
+        ((rs2 == 5'b00000) || (rs2 == 5'b00001)) && valid_rm;
+    assign fp_mvwx = (opcode == OPC_OP_FP) && (funct7 == 7'b1111000) &&
+        (rs2 == 5'b00000) && (funct3 == 3'b000);
+    assign valid_op_fp = fp_arith_2src || fp_sqrt || fp_sgnj || fp_minmax ||
+        fp_cmp || fp_class_mvxw || fp_cvt_w_s || fp_cvt_s_w || fp_mvwx;
 
-    // CSR instructions: SYSTEM, funct3 != 000/100, address in {0x001, 0x002, 0x003}
+    // CSR instructions on fflags, frm, and fcsr only
     wire valid_csr;
-    assign valid_csr =
-        (opcode == OPC_SYSTEM) &&
-        (funct3 != 3'b000) &&
-        (funct3 != 3'b100) &&
+    assign valid_csr = (opcode == OPC_SYSTEM) &&
+        ((funct3 == 3'b001) || (funct3 == 3'b010) || (funct3 == 3'b011) ||
+         (funct3 == 3'b101) || (funct3 == 3'b110) || (funct3 == 3'b111)) &&
         ((csr_addr == 12'h001) || (csr_addr == 12'h002) || (csr_addr == 12'h003));
 
     // New Phase 6 output assignments
-    assign o_mext    = valid_mext;
-    assign o_fpu     = valid_op_fp || valid_fused || valid_csr;
+    assign o_mext = valid_mext;
+    assign o_fpu = valid_op_fp || valid_fused || valid_csr;
     assign o_frs1_en = valid_fused || fp_arith_2src || fp_sqrt || fp_sgnj ||
-                       fp_minmax   || fp_cmp        || fp_class_mvxw || fp_cvt_w_s;
-    assign o_frs2_en = valid_fsw   || valid_fused   || fp_arith_2src || fp_sgnj ||
-                       fp_minmax   || fp_cmp;
+        fp_minmax || fp_cmp || fp_class_mvxw || fp_cvt_w_s;
+    assign o_frs2_en = valid_fsw || valid_fused || fp_arith_2src ||
+        fp_sgnj || fp_minmax || fp_cmp;
     assign o_frs3_en = valid_fused;
-    assign o_rs3     = rs3;
-    assign o_frd_en  = valid_flw   || valid_fused   || fp_arith_2src || fp_sqrt ||
-                       fp_sgnj     || fp_minmax     || fp_cvt_s_w    || fp_mvwx;
+    assign o_rs3 = rs3;
+    assign o_frd_en = valid_flw || valid_fused || fp_arith_2src || fp_sqrt ||
+        fp_sgnj || fp_minmax || fp_cvt_s_w || fp_mvwx;
 
     wire fpu_writes_int_rd;
     assign fpu_writes_int_rd = fp_cmp || fp_class_mvxw || fp_cvt_w_s || valid_csr;
 
-    assign o_legal =
-        valid_op      ||
-        valid_opimm   ||
-        valid_load    ||
-        valid_store   ||
-        valid_branch  ||
-        valid_jalr    ||
-        valid_jal     ||
-        valid_lui     ||
-        valid_auipc   ||
-        valid_ebreak;
-        // <--- PHASE 6 ADDITION: Include M, F, and CSR legality
-        valid_mext    ||
-        valid_flw     ||
-        valid_fsw     ||
-        valid_fused   ||
-        valid_op_fp   ||
-        valid_csr;
-
+    assign o_legal = valid_op || valid_opimm || valid_load || valid_store ||
+        valid_branch || valid_jalr || valid_jal || valid_lui || valid_auipc ||
+        valid_ebreak || valid_mext || valid_flw || valid_fsw || valid_fused ||
+        valid_op_fp || valid_csr;
     assign o_halt = valid_ebreak;
 
     // Registers
-    assign o_rs1 =
-        (valid_op ||
-        valid_opimm ||
-        valid_load ||
-        valid_store ||
-        valid_branch ||
-        valid_jalr   ||
-        // <--- PHASE 6 ADDITION: Instructions that read integer rs1 or FP fs1
-        valid_mext   ||
-        valid_flw    ||
-        valid_fsw    ||
-        fp_cvt_s_w   ||
-        fp_mvwx      ||
-        (valid_csr && !funct3[2]) ||
-        o_frs1_en) ? rs1 : 5'd0;
-
-    assign o_rs2 =
-        (valid_op ||
-        valid_store ||
-        valid_branch ||
-        // <--- PHASE 6 ADDITION: Instructions that read integer rs2 or FP fs2
-        valid_mext   ||
+    assign o_rs1 = (valid_op || valid_opimm || valid_load || valid_store ||
+        valid_branch || valid_jalr || valid_mext || valid_flw || valid_fsw ||
+        fp_cvt_s_w || fp_mvwx || (valid_csr && !funct3[2]) || o_frs1_en)
+        ? rs1 : 5'd0;
+    assign o_rs2 = (valid_op || valid_store || valid_branch || valid_mext ||
         o_frs2_en) ? rs2 : 5'd0;
-
-    assign o_rd =
-        (valid_op    ||
-         valid_opimm ||
-         valid_load  ||
-         valid_jalr  ||
-         valid_jal   ||
-         valid_lui   ||
-         valid_auipc       ||
-         // <--- PHASE 6 ADDITION: M-extension and FPU-to-integer writes (o_rd is 0 when o_frd_en is 1)
-         valid_mext        ||
-         fpu_writes_int_rd) ? rd : 5'd0;
+    assign o_rd = (valid_op || valid_opimm || valid_load || valid_jalr ||
+        valid_jal || valid_lui || valid_auipc || valid_mext ||
+        fpu_writes_int_rd) ? rd : 5'd0;
 
     // Immediate format
-    // bit 0: R -> none
-    // bit 1: I
-    // bit 2: S
-    // bit 3: B
-    // bit 4: U
-    // bit 5: J
     wire [5:0] imm_format;
-
     assign imm_format =
-        // <--- PHASE 6 CHANGE: Added valid_mext/valid_op_fp/valid_fused to R, valid_flw/valid_csr to I, valid_fsw to S
-        (valid_op || valid_mext ||
-         valid_op_fp || valid_fused)     ? 6'b000001 :
-        (valid_opimm || valid_load ||
-         valid_jalr || valid_flw ||
-         valid_csr)                      ? 6'b000010 :
-        (valid_store || valid_fsw)       ? 6'b000100 :
-        valid_branch                     ? 6'b001000 :
-        (valid_lui || valid_auipc)       ? 6'b010000 :
-        valid_jal                        ? 6'b100000 :
-                                           6'b000000;
-
+        (valid_op || valid_mext || valid_op_fp || valid_fused) ? 6'b000001 :
+        (valid_opimm || valid_load || valid_jalr || valid_flw || valid_csr) ? 6'b000010 :
+        (valid_store || valid_fsw) ? 6'b000100 :
+        valid_branch ? 6'b001000 :
+        (valid_lui || valid_auipc) ? 6'b010000 :
+        valid_jal ? 6'b100000 : 6'b000000;
     imm u_imm (
         .i_inst      (i_inst),
         .i_format    (imm_format),
         .o_immediate (o_immediate)
     );
 
-    // Operand 1
-    // general: rs1
-    // auipc: pc
+    // Operand selections and ALU controls
     assign o_op1_sel = valid_auipc;
+    assign o_op2_sel = valid_opimm || valid_load || valid_store || valid_auipc ||
+        valid_jalr || valid_flw || valid_fsw;
+    assign o_alu_opsel = (valid_op || valid_mext || valid_opimm) ? funct3 :
+        (valid_branch && funct3[1]) ? 3'b011 : 3'b000;
+    assign o_alu_sub = valid_op && (funct3 == 3'b000) && (funct7 == 7'b0100000);
+    assign o_alu_unsigned = (valid_op && (funct3 == 3'b011)) ||
+        (valid_opimm && (funct3 == 3'b011)) || (valid_branch && funct3[1]);
+    assign o_alu_arith = (valid_op || valid_opimm) &&
+        (funct3 == 3'b101) && (funct7 == 7'b0100000);
 
-    // Operand 2
-    // R/B: rs2
-    // Immediate -> assert
-    assign o_op2_sel =
-        valid_opimm ||
-        valid_load  ||
-        valid_store ||
-        valid_auipc ||
-        valid_jalr  ||
-        // <--- PHASE 6 ADDITION: flw and fsw also add immediate offset to rs1 in ALU
-        valid_flw   ||
-        valid_fsw;
-
-    assign o_alu_opsel =
-        // <--- PHASE 6 CHANGE: Added `valid_mext` so RV32M passes funct3 to ALU
-        (valid_op || valid_mext || valid_opimm) ? funct3 :
-        (valid_branch && funct3[1])             ? 3'b011 :
-                                                  3'b000;
-
-
-    // add: funct7 -> 0000000
-    // sub:        -> 0100000
-    assign o_alu_sub =
-        valid_op &&
-        (funct3 == 3'b000) &&
-        (funct7 == 7'b0100000);
-
-    // sltu, sltiu, bltu, bgeu
-    assign o_alu_unsigned =
-        (valid_op &&
-         (funct3 == 3'b011)) ||
-        (valid_opimm &&
-         (funct3 == 3'b011)) ||
-        (valid_branch &&
-         funct3[1]);
-
-    // sra, srai
-    assign o_alu_arith =
-        (valid_op || valid_opimm) &&
-        (funct3 == 3'b101) &&
-        (funct7 == 7'b0100000);
-
-    // B
-    // beq: funct3 -> 000
-    // bne:           001
-    // blt:           100
-    // bge:           101
-    // bltu:          110
-    // bgeu:          111
+    // Branch and jump controls
     assign o_branch = valid_branch;
-    assign o_jump   = valid_jal || valid_jalr;
-
-    assign o_branch_equal =
-        valid_branch && !funct3[2];
-
-    assign o_branch_unsigned =
-        valid_branch && funct3[1];
-
-    assign o_branch_invert =
-        valid_branch && funct3[0];
-
-    // jalr
-    // rs1: jump target base
+    assign o_jump = valid_jal || valid_jalr;
+    assign o_branch_equal = valid_branch && !funct3[2];
+    assign o_branch_unsigned = valid_branch && funct3[1];
+    assign o_branch_invert = valid_branch && funct3[0];
     assign o_pc_sel = valid_jalr;
 
-    // funct3[1:0] -> access width
-    // 00: byte
-    // 01: half-word
-    // 10: word
-    // <--- PHASE 6 CHANGE: Added `valid_flw` to `o_dmem_ren` and `valid_fsw` to `o_dmem_wen`
-    assign o_dmem_ren = valid_load  || valid_flw;
+    // Memory controls
+    assign o_dmem_ren = valid_load || valid_flw;
     assign o_dmem_wen = valid_store || valid_fsw;
-
-    assign o_dmem_memb =
-        (valid_load || valid_store) &&
-        (funct3[1:0] == 2'b00);
-
-    assign o_dmem_memh =
-        (valid_load || valid_store) &&
-        (funct3[1:0] == 2'b01);
-
-    // <--- PHASE 6 CHANGE: Added `valid_flw || valid_fsw` (word-sized memory accesses)
-    assign o_dmem_memw =
-        ((valid_load || valid_store) &&
-         (funct3[1:0] == 2'b10)) ||
-        valid_flw ||
-        valid_fsw;
-
-    // Alignment masks
-    // 00: no restriction
-    // 01: bit 0 = 0
-    // 11: bits 1:0 = 0
-    assign o_dmem_align =
-        o_dmem_memw ? 2'b11 :
-        o_dmem_memh ? 2'b01 :
-                       2'b00;
-
-    // lbu, lhu = unsigned loads
-    assign o_dmem_memu =
-        valid_load &&
-        ((funct3 == 3'b100) ||
-         (funct3 == 3'b101));
+    assign o_dmem_memb = (valid_load || valid_store) && (funct3[1:0] == 2'b00);
+    assign o_dmem_memh = (valid_load || valid_store) && (funct3[1:0] == 2'b01);
+    assign o_dmem_memw = ((valid_load || valid_store) &&
+        (funct3[1:0] == 2'b10)) || valid_flw || valid_fsw;
+    assign o_dmem_align = o_dmem_memw ? 2'b11 :
+        o_dmem_memh ? 2'b01 : 2'b00;
+    assign o_dmem_memu = valid_load &&
+        ((funct3 == 3'b100) || (funct3 == 3'b101));
 
     // Register writeback select
-    // 0: alu
-    // 1: imm
-    // 2: pc + 4
-    // 3: mem
-    // 4: fpu integer result  <--- PHASE 6 CHANGE: widened to 5 bits, added valid_mext and fpu_writes_int_rd
     assign o_rd_sel =
-        (valid_op    ||
-         valid_mext  ||
-         valid_opimm ||
-         valid_auipc)      ? 5'b00001 :
-        valid_lui          ? 5'b00010 :
-        (valid_jal ||
-         valid_jalr)       ? 5'b00100 :
-        valid_load         ? 5'b01000 :
-        fpu_writes_int_rd  ? 5'b10000 :
-                             5'b00000;
-
-
+        (valid_op || valid_mext || valid_opimm || valid_auipc) ? 5'b00001 :
+        valid_lui ? 5'b00010 :
+        (valid_jal || valid_jalr) ? 5'b00100 :
+        valid_load ? 5'b01000 :
+        fpu_writes_int_rd ? 5'b10000 :
+        5'b00000;
 endmodule
-
 `default_nettype wire
