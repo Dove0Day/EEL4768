@@ -43,7 +43,6 @@ module riscv_fv (
   //   );
   // -------------------------------------------------------------------------
 
-  // Added implementation. The original skeleton above is unchanged.
   localparam TAG_W = 3;
 
   (* anyseq *) reg [TAG_W-1:0] i_rob_head;
@@ -116,7 +115,6 @@ module riscv_fv (
   //       assert (...);
   //   end
 
-  // Added formal properties. The original skeleton above is unchanged.
   reg f_past_valid;
   initial f_past_valid = 1'b0;
   always @(posedge i_clk)
