@@ -1,0 +1,17 @@
+# Graded FV job — identical for every student / grader run.
+# Top: riscv_fv. Fixed sources: harness + required separate OoO modules.
+[options]
+mode bmc
+depth 16
+
+[engines]
+smtbmc z3
+
+[script]
+read -sv riscv_fv.v cdb_arb.v rat.v
+prep -top riscv_fv
+
+[files]
+riscv_fv.v
+cdb_arb.v
+rat.v

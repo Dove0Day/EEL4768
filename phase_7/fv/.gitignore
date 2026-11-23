@@ -1,0 +1,3 @@
+# SymbiYosys workdirs next to .sby files
+example/mutex/mutex/
+riscv/riscv_fv/
