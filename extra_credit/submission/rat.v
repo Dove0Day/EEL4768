@@ -35,6 +35,11 @@ module rat #(
     // clear whole table (tie to 0 if unused)
     input  wire             i_flush,
 
+    // checkpoint of the table: save at issue of a speculative branch,
+    // restore on a mispredict (tie both to 0 if unused)
+    input  wire             i_ckpt_save,
+    input  wire             i_ckpt_restore,
+
     // busy bit for every register (debug / FV)
     output wire [31:0]      o_busy
 );
@@ -73,15 +78,46 @@ module rat #(
         end
     endgenerate
 
+    // checkpoint: older instructions keep committing after the save, so the
+    // checkpoint also drops busy bits whose producer commits
+    reg  [31:0]      ckpt_busy_q;
+    reg  [TAG_W-1:0] ckpt_tag_q [0:31];
+    wire [31:0]      ckpt_busy_commit;
+
+    generate
+        for (g = 0; g < 32; g = g + 1) begin : gen_ckpt
+            assign ckpt_busy_commit[g] = ckpt_busy_q[g] &&
+                !(i_commit_en && (i_commit_rd == g) && (ckpt_tag_q[g] == i_commit_tag));
+        end
+    endgenerate
+
+    integer k;
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            ckpt_busy_q <= 32'b0;
+        end
+        else if (i_ckpt_save) begin
+            ckpt_busy_q <= busy_next;   // includes this cycle's rename/commit
+            for (k = 0; k < 32; k = k + 1)
+                ckpt_tag_q[k] <= (rename_ok && (i_rename_rd == k)) ? i_rename_tag : tag_q[k];
+        end
+        else begin
+            ckpt_busy_q <= ckpt_busy_commit;
+        end
+    end
+
     // table update
     always @(posedge i_clk) begin
         if (i_rst) begin
             busy_q <= 32'b0;
         end
         else begin
-            busy_q <= busy_next;
+            busy_q <= i_ckpt_restore ? ckpt_busy_commit : busy_next;
             if (rename_ok && !i_flush)
                 tag_q[i_rename_rd] <= i_rename_tag;
+            if (i_ckpt_restore)
+                for (k = 0; k < 32; k = k + 1)
+                    tag_q[k] <= ckpt_tag_q[k];
         end
     end
 
