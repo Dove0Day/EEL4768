@@ -187,6 +187,69 @@ module hart #(
     reg  [31:0] ifid_inst;
     reg  [31:0] ifid_pc;
 
+    // dynamic branch prediction
+    // 2-bit BHT + BTB (predicted in IF)
+    localparam BP_IDX_W   = 6;                    // 64 entries
+    localparam BP_ENTRIES = 1 << BP_IDX_W;
+    localparam BP_TAG_W   = 32 - 2 - BP_IDX_W;
+
+    reg [1:0]          bht_q       [0:BP_ENTRIES-1];  // 00 SNT 01 WNT 10 WT 11 ST
+    reg                btb_valid_q [0:BP_ENTRIES-1];
+    reg [BP_TAG_W-1:0] btb_tag_q   [0:BP_ENTRIES-1];
+    reg [31:0]         btb_tgt_q   [0:BP_ENTRIES-1];
+
+    // update bus from the backend (driven when a conditional branch resolves)
+    wire        bp_upd_valid;
+    wire [31:0] bp_upd_pc;
+    wire        bp_upd_taken;
+    wire [31:0] bp_upd_target;
+
+    // prediction for the instruction at pc (imem is combinational)
+    wire [BP_IDX_W-1:0] bp_rd_idx;
+    wire [BP_TAG_W-1:0] bp_rd_tag;
+    wire                if_is_branch;
+    wire                if_pred_taken;
+    wire [31:0]         if_pred_target;
+    wire [31:0]         if_next_pc;
+
+    assign bp_rd_idx      = pc[BP_IDX_W+1:2];
+    assign bp_rd_tag      = pc[31:BP_IDX_W+2];
+    assign if_is_branch   = (i_imem_rdata[6:0] == 7'b1100011);
+    assign if_pred_taken  = if_is_branch &&
+                            btb_valid_q[bp_rd_idx] &&
+                            (btb_tag_q[bp_rd_idx] == bp_rd_tag) &&
+                            bht_q[bp_rd_idx][1];
+    assign if_pred_target = btb_tgt_q[bp_rd_idx];
+    assign if_next_pc     = if_pred_taken ? if_pred_target : pc_plus4;
+
+    // prediction travels with the instruction
+    reg         ifid_pred_taken;
+    reg  [31:0] ifid_pred_target;
+
+    // BHT / BTB update
+    wire [BP_IDX_W-1:0] bp_upd_idx;
+    assign bp_upd_idx = bp_upd_pc[BP_IDX_W+1:2];
+
+    integer bp_i;
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            for (bp_i = 0; bp_i < BP_ENTRIES; bp_i = bp_i + 1) begin
+                bht_q[bp_i]       <= 2'b01;   // weakly not taken
+                btb_valid_q[bp_i] <= 1'b0;
+            end
+        end else if (bp_upd_valid) begin
+            if (bp_upd_taken) begin
+                if (bht_q[bp_upd_idx] != 2'b11)
+                    bht_q[bp_upd_idx] <= bht_q[bp_upd_idx] + 2'd1;
+                btb_valid_q[bp_upd_idx] <= 1'b1;
+                btb_tag_q[bp_upd_idx]   <= bp_upd_pc[31:BP_IDX_W+2];
+                btb_tgt_q[bp_upd_idx]   <= bp_upd_target;
+            end else if (bht_q[bp_upd_idx] != 2'b00) begin
+                bht_q[bp_upd_idx] <= bht_q[bp_upd_idx] - 2'd1;
+            end
+        end
+    end
+
         // ID stage: decoder and register file
 
     wire        dec_legal; // high if instruction encoding is valid
@@ -406,6 +469,11 @@ module hart #(
         .i_id_valid           (ifid_valid),
         .i_id_inst            (ifid_inst),
         .i_id_pc              (ifid_pc),
+
+        // used for dynamic branch prediction
+        .i_id_pred_taken      (ifid_pred_taken),
+        .i_id_pred_target     (ifid_pred_target),
+        
         .i_dec_legal          (dec_legal),
         .i_dec_halt           (id_halt),
         .i_dec_rs1            (id_rs1_addr),
@@ -463,6 +531,12 @@ module hart #(
         .o_id_hold            (ooo_id_hold),
         .o_fetch_stall        (ooo_fetch_stall),
 
+        // for dynamic branch prediction
+        .o_bp_upd_valid       (bp_upd_valid),
+        .o_bp_upd_pc          (bp_upd_pc),
+        .o_bp_upd_taken       (bp_upd_taken),
+        .o_bp_upd_target      (bp_upd_target),
+
         // LSU <-> Data Cache Interface
         .o_dcache_ren         (dcache_ren),
         .o_dcache_wen         (dcache_wen),
@@ -515,48 +589,52 @@ module hart #(
     // [PHASE 7 NEW] Replaced Phase 6's giant 5-stage always block with a clean
     // frontend-only always block controlled by ooo_taken, ooo_id_hold, and
     // ooo_fetch_stall.
-    always @(posedge i_clk) begin
+        always @(posedge i_clk) begin
         if (i_rst) begin
-            pc         <= RESET_ADDR;
-            stop_fetch <= 1'b0;
-            ifid_valid <= 1'b0;
-            ifid_inst  <= NOP;
-            ifid_pc    <= RESET_ADDR;
+            pc               <= RESET_ADDR;
+            stop_fetch       <= 1'b0;
+            ifid_valid       <= 1'b0;
+            ifid_inst        <= NOP;
+            ifid_pc          <= RESET_ADDR;
+            ifid_pred_taken  <= 1'b0;
+            ifid_pred_target <= 32'd0;
         end
         else if (ooo_taken) begin
-            // Branch/jump resolved as taken: redirect PC and squash IF/ID
-            pc         <= ooo_pc_jump;
-            stop_fetch <= 1'b0;
-            ifid_valid <= 1'b0;
-            ifid_inst  <= NOP;
+            // mispredict (or jump) resolved: redirect to the CORRECT next pc, squash IF/ID
+            pc               <= ooo_pc_jump;
+            stop_fetch       <= 1'b0;
+            ifid_valid       <= 1'b0;
+            ifid_inst        <= NOP;
+            ifid_pred_taken  <= 1'b0;
         end
         else if (ooo_id_hold) begin
-            // Backend is full or waiting on an in-flight branch:
-            // freeze PC and IF/ID (do NOT inject a NOP)
-            pc         <= pc;
-            ifid_valid <= ifid_valid;
-            ifid_inst  <= ifid_inst;
-            ifid_pc    <= ifid_pc;
+            pc               <= pc;
+            ifid_valid       <= ifid_valid;
+            ifid_inst        <= ifid_inst;
+            ifid_pc          <= ifid_pc;
+            ifid_pred_taken  <= ifid_pred_taken;
+            ifid_pred_target <= ifid_pred_target;
         end
         else if (id_halt) begin
-            // ebreak is issuing into the ROB now: stop fetching younger insts
-            stop_fetch <= 1'b1;
-            pc         <= pc;
-            ifid_valid <= 1'b0;
-            ifid_inst  <= NOP;
+            stop_fetch       <= 1'b1;
+            pc               <= pc;
+            ifid_valid       <= 1'b0;
+            ifid_inst        <= NOP;
+            ifid_pred_taken  <= 1'b0;
         end
         else if (stop_fetch || ooo_fetch_stall) begin
-            // Halted or fetch-stalled: inject NOP bubble into IF/ID
-            pc         <= pc;
-            ifid_valid <= 1'b0;
-            ifid_inst  <= NOP;
+            pc               <= pc;
+            ifid_valid       <= 1'b0;
+            ifid_inst        <= NOP;
+            ifid_pred_taken  <= 1'b0;
         end
         else begin
-            // Normal fetch: advance PC and latch combinational imem word
-            pc         <= pc_plus4;
-            ifid_valid <= 1'b1;
-            ifid_inst  <= i_imem_rdata;
-            ifid_pc    <= pc;
+            pc               <= if_next_pc;          // <-- was pc_plus4
+            ifid_valid       <= 1'b1;
+            ifid_inst        <= i_imem_rdata;
+            ifid_pc          <= pc;
+            ifid_pred_taken  <= if_pred_taken;
+            ifid_pred_target <= if_pred_target;
         end
     end
 
