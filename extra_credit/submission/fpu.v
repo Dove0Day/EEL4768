@@ -52,6 +52,8 @@ module fpu (
     // Asserted when a rounding instruction selects the dynamic rounding mode
     // (rm = 111) while frm holds a reserved value (101-111). The instruction
     // traps as illegal and changes no state.
+    input wire [2:0] i_shared_frm,
+    input wire [4:0] i_shared_flags,
     output wire        o_rm_trap
 );
 
@@ -76,8 +78,8 @@ module fpu (
 
     // Floating-point control and status state
     // accrued_flags contains NV, DZ, OF, UF, and NX, frm stores the rounding mode
-    reg [4:0] accrued_flags;
-    reg [2:0] frm;
+    wire [4:0] accrued_flags = i_shared_flags;
+    wire [2:0] frm = i_shared_frm;
 
     // Identify CSR instructions and fused multiply-add family instructions
     wire is_csr = (opcode == OPC_SYSTEM) && (funct3 != 3'b000);
@@ -878,59 +880,116 @@ module fpu (
          (cvt_i_rounded[24]?cvt_i_rounded[23:1]:cvt_i_rounded[22:0])};
     wire [4:0] cvt_s_w_flags={4'd0,cvt_i_inexact};
 
-    // Float-to-integer conversion
-    wire cvt_w_unsigned=rs2_field[0];
+// Float-to-integer conversion
+wire cvt_w_unsigned = rs2_field[0];
 
-    // Offset by 256: actual shift = exponent-150, encoded as exponent+106.
-    wire [11:0] cvt_w_shift={4'd0,i_frs1[30:23]}+12'd106;
-    wire cvt_w_shift_negative=(cvt_w_shift<12'd256);
-    wire [11:0] cvt_w_shift_magnitude=cvt_w_shift_negative?
-        (12'd256-cvt_w_shift):(cvt_w_shift-12'd256);
-    wire [63:0] cvt_w_base={40'd0,sig_a};
-    wire [5:0] cvt_w_rshift=(cvt_w_shift_magnitude>12'd63)?
-        6'd63:cvt_w_shift_magnitude[5:0];
-    wire [63:0] cvt_w_right_1=cvt_w_rshift[0]?
-        {1'b0,cvt_w_base[63:2],|cvt_w_base[1:0]}:cvt_w_base;
-    wire [63:0] cvt_w_right_2=cvt_w_rshift[1]?
-        {2'b0,cvt_w_right_1[63:3],|cvt_w_right_1[2:0]}:cvt_w_right_1;
-    wire [63:0] cvt_w_right_4=cvt_w_rshift[2]?
-        {4'b0,cvt_w_right_2[63:5],|cvt_w_right_2[4:0]}:cvt_w_right_2;
-    wire [63:0] cvt_w_right_8=cvt_w_rshift[3]?
-        {8'b0,cvt_w_right_4[63:9],|cvt_w_right_4[8:0]}:cvt_w_right_4;
-    wire [63:0] cvt_w_right_16=cvt_w_rshift[4]?
-        {16'b0,cvt_w_right_8[63:17],|cvt_w_right_8[16:0]}:cvt_w_right_8;
-    wire [63:0] cvt_w_shifted_right=cvt_w_rshift[5]?
-        {32'b0,cvt_w_right_16[63:33],|cvt_w_right_16[32:0]}:cvt_w_right_16;
+wire [7:0] cvt_w_exp = i_frs1[30:23];
+wire cvt_w_neg = i_frs1[31];
 
-    // Literal-stage left barrel shifter
-    wire [63:0] cvt_w_left_1 = cvt_w_shift[0] ?
-        {cvt_w_base[62:0],1'b0} : cvt_w_base;
-    wire [63:0] cvt_w_left_2 = cvt_w_shift[1] ?
-        {cvt_w_left_1[61:0],2'b0} : cvt_w_left_1;
-    wire [63:0] cvt_w_left_4 = cvt_w_shift[2] ?
-        {cvt_w_left_2[59:0],4'b0} : cvt_w_left_2;
-    wire [63:0] cvt_w_left_8 = cvt_w_shift[3] ?
-        {cvt_w_left_4[55:0],8'b0} : cvt_w_left_4;
-    wire [63:0] cvt_w_left_16 = cvt_w_shift[4] ?
-        {cvt_w_left_8[47:0],16'b0} : cvt_w_left_8;
-    wire [63:0] cvt_w_left_32 = cvt_w_shift[5] ?
-        {cvt_w_left_16[31:0],32'b0} : cvt_w_left_16;
-    wire [63:0] cvt_w_shifted_left = (cvt_w_shift_magnitude>=12'd40) ?
-        64'hffff_ffff_ffff_ffff : cvt_w_left_32;
-    wire [63:0] cvt_w_mag=cvt_w_shift_negative?
-        cvt_w_shifted_right:cvt_w_shifted_left;
-    wire cvt_w_inexact=cvt_w_shift_negative&&cvt_w_shifted_right[0];
-    wire cvt_w_invalid=a_nan||a_inf||(cvt_w_unsigned&&i_frs1[31])||
-        (!cvt_w_unsigned&&(cvt_w_mag[63:31]!=33'd0))||
-        (cvt_w_unsigned&&(cvt_w_mag[63:32]!=32'd0));
-    wire [31:0] cvt_w_signed_mag=cvt_w_mag[31:0];
-    wire [31:0] cvt_w_signed_value=i_frs1[31]?(~cvt_w_signed_mag+32'd1):cvt_w_signed_mag;
-    wire [31:0] cvt_w_result=cvt_w_invalid?
-        (cvt_w_unsigned?(i_frs1[31]?32'd0:32'hffff_ffff):
-         (i_frs1[31]?32'h8000_0000:32'h7fff_ffff)):
-        (cvt_w_unsigned?cvt_w_signed_mag:cvt_w_signed_value);
-    wire [4:0] cvt_w_flags={cvt_w_invalid,3'd0,(!cvt_w_invalid&&cvt_w_inexact)};
+wire [7:0] cvt_w_rdist = 8'd150 - cvt_w_exp;
+wire [7:0] cvt_w_ldist = cvt_w_exp - 8'd150;
 
+// Preserve fractional bits for rounding.
+wire [63:0] cvt_w_base = {16'd0, sig_a, 24'd0};
+
+wire [63:0] cvt_w_r1 = cvt_w_rdist[0] ?
+    (cvt_w_base >> 1) : cvt_w_base;
+wire [63:0] cvt_w_r2 = cvt_w_rdist[1] ?
+    (cvt_w_r1 >> 2) : cvt_w_r1;
+wire [63:0] cvt_w_r4 = cvt_w_rdist[2] ?
+    (cvt_w_r2 >> 4) : cvt_w_r2;
+wire [63:0] cvt_w_r8 = cvt_w_rdist[3] ?
+    (cvt_w_r4 >> 8) : cvt_w_r4;
+wire [63:0] cvt_w_r16 = cvt_w_rdist[4] ?
+    (cvt_w_r8 >> 16) : cvt_w_r8;
+wire [63:0] cvt_w_r32 = cvt_w_rdist[5] ?
+    (cvt_w_r16 >> 32) : cvt_w_r16;
+
+wire [63:0] cvt_w_right =
+    (cvt_w_rdist >= 8'd24) ? 64'd0 : cvt_w_r32;
+
+wire [63:0] cvt_w_lbase = {40'd0, sig_a};
+
+wire [63:0] cvt_w_l1 = cvt_w_ldist[0] ?
+    (cvt_w_lbase << 1) : cvt_w_lbase;
+wire [63:0] cvt_w_l2 = cvt_w_ldist[1] ?
+    (cvt_w_l1 << 2) : cvt_w_l1;
+wire [63:0] cvt_w_l4 = cvt_w_ldist[2] ?
+    (cvt_w_l2 << 4) : cvt_w_l2;
+wire [63:0] cvt_w_l8 = cvt_w_ldist[3] ?
+    (cvt_w_l4 << 8) : cvt_w_l4;
+wire [63:0] cvt_w_l16 = cvt_w_ldist[4] ?
+    (cvt_w_l8 << 16) : cvt_w_l8;
+
+wire [63:0] cvt_w_mag =
+    (cvt_w_exp < 8'd127) ? 64'd0 :
+    (cvt_w_exp < 8'd150) ?
+        {24'd0, cvt_w_right[63:24]} :
+    (cvt_w_ldist >= 8'd32) ?
+        64'hffffffffffffffff : cvt_w_l16;
+
+wire cvt_w_guard =
+    (cvt_w_exp == 8'd126) ? 1'b1 :
+    (cvt_w_exp < 8'd126) ? 1'b0 :
+    (cvt_w_exp < 8'd150) ?
+        cvt_w_right[23] : 1'b0;
+
+wire cvt_w_sticky =
+    (cvt_w_exp < 8'd126) ? !a_zero :
+    (cvt_w_exp == 8'd126) ? |i_frs1[22:0] :
+    (cvt_w_exp < 8'd150) ?
+        |cvt_w_right[22:0] : 1'b0;
+
+wire cvt_w_inexact = cvt_w_guard | cvt_w_sticky;
+
+// RNE, RTZ, RDN, RUP, RMM.
+wire cvt_w_round_up =
+    (selected_rm == 3'b000) ?
+        (cvt_w_guard &&
+         (cvt_w_sticky || cvt_w_mag[0])) :
+    (selected_rm == 3'b001) ? 1'b0 :
+    (selected_rm == 3'b010) ?
+        (cvt_w_neg && cvt_w_inexact) :
+    (selected_rm == 3'b011) ?
+        (!cvt_w_neg && cvt_w_inexact) :
+    (selected_rm == 3'b100) ?
+        cvt_w_guard : 1'b0;
+
+wire [63:0] cvt_w_rounded =
+    cvt_w_mag + {63'd0, cvt_w_round_up};
+
+wire cvt_w_invalid =
+    a_nan || a_inf ||
+    (cvt_w_exp > 8'd158) ||
+    (cvt_w_unsigned ?
+        ((cvt_w_neg && (cvt_w_rounded != 64'd0)) ||
+         (cvt_w_rounded > 64'h00000000ffffffff)) :
+        (cvt_w_neg ?
+         (cvt_w_rounded > 64'h0000000080000000) :
+         (cvt_w_rounded > 64'h000000007fffffff)));
+
+wire [31:0] cvt_w_signed_mag =
+    cvt_w_rounded[31:0];
+
+wire [31:0] cvt_w_signed_value =
+    cvt_w_neg ?
+    (~cvt_w_signed_mag + 32'd1) :
+    cvt_w_signed_mag;
+
+wire [31:0] cvt_w_result =
+    cvt_w_invalid ?
+        (cvt_w_unsigned ?
+            ((cvt_w_neg && !a_nan) ?
+                32'd0 : 32'hffffffff) :
+            ((cvt_w_neg && !a_nan) ?
+                32'h80000000 : 32'h7fffffff)) :
+        cvt_w_signed_value;
+
+wire [4:0] cvt_w_flags =
+    {cvt_w_invalid, 3'd0,
+     (!cvt_w_invalid && cvt_w_inexact)};
+
+    
     // Results and per-instruction flags
     // Arithmetic datapaths use a normalized extended significand
     // Fused path retains the 48-bit product before the addend is aligned, so only the final result is rounded.
@@ -1128,26 +1187,11 @@ module fpu (
             held_fp_result <= 32'd0;
             held_int_result <= 32'd0;
             held_flags <= 5'd0;
-            accrued_flags <= 5'd0;
-            frm <= 3'd0;
         end else begin
             if (state == ST_IDLE) begin
                 if (long_operation && !o_rm_trap) begin
                     state <= ST_RUN;
                     count <= 6'd0;
-                end else if (i_valid && i_advance) begin
-                    if (is_csr) begin
-                        if (csr_write_en) begin
-                            case (csr_addr)
-                                12'h001: accrued_flags <= csr_new[4:0];
-                                12'h002: frm <= csr_new[2:0];
-                                12'h003: begin accrued_flags <= csr_new[4:0]; frm <= csr_new[7:5]; end
-                                default: begin accrued_flags <= accrued_flags; frm <= frm; end
-                            endcase
-                        end
-                    end else begin
-                        accrued_flags <= accrued_flags | instruction_flags;
-                    end
                 end
             end else if (state == ST_RUN) begin
                 count <= count_next;
@@ -1159,7 +1203,6 @@ module fpu (
                 end
             end else if (state == ST_DONE) begin
                 if (i_advance) begin
-                    accrued_flags <= accrued_flags | held_flags;
                     state <= ST_IDLE;
                 end
             end else begin
@@ -1171,7 +1214,7 @@ module fpu (
     assign o_busy = i_valid && long_operation && !o_rm_trap && (state != ST_DONE);
     assign o_fp_result = (state == ST_DONE) ? held_fp_result : fp_result_comb;
     assign o_int_result = (state == ST_DONE) ? held_int_result : int_result_comb;
-    assign o_fflags = accrued_flags |
+    assign o_fflags =
         ((state == ST_DONE) ? held_flags : (i_valid && !is_csr ? instruction_flags : 5'd0));
 
 endmodule
