@@ -169,13 +169,27 @@ module ooo_core (
         if(mispred) csr_barrier<=0;
       end
     end
+
+    // [EBR+BP] Dedicated 1-entry branch/jump resolver (at most 1 unresolved branch
+    // or jump can be in-flight because `ctrl` / `cbr_inflight` block a second one)
+    reg br_valid;
+    reg [2:0] br_tag;
+    wire issue_ctrl = !terminal && (i_dec_branch || i_dec_jump);
+
+
     // [BP] jumps still serialize issue; a conditional branch only blocks issue of
     // a second control instruction while it is unresolved (one speculative branch)
+
+    // [ERB] don't stall control ops on `icount == 4`
+
     assign o_id_hold = ctrl || csr_barrier || count == 8 ||
                        (cbr_inflight && !terminal && (i_dec_branch || i_dec_jump)) ||
-                       (!terminal && !ismem && (isfp ? fcount == 4 : icount == 4));
+                       (!terminal && !ismem && !issue_ctrl && (isfp ? fcount == 4 : icount == 4));
     assign o_fetch_stall = 1'b0;
-    assign issue = i_id_valid && !o_id_hold && !o_taken && !i_rst;
+
+    // [EBR+BP] Only block `issue` on an OLDER branch's mispredict (`mispred`), not an
+    // issue-time redirect, to avoid a combinational loop
+    assign issue = i_id_valid && !o_id_hold && !mispred && !i_rst;
 
     wire busy0; wire [2:0] tag0;
     reg [4:0] addr0[0:7];
@@ -212,8 +226,14 @@ module ooo_core (
     wire pending4 = busy4 && (!done[tag4] || trap[tag4]) && !hit4 && !(commit && trap[head] && head==tag4);
     wire [31:0] source4 = busy4 ? (hit4 ? cd : (commit && trap[head] && head==tag4) ? trap_f_value : result[tag4]) : i_rf_frs3_data;
 
-    // [BP] checkpoint the RAT when a conditional branch issues, restore it on a mispredict
-    wire ckpt_save = issue && !terminal && i_dec_branch;
+    // [EBR+BP] Only checkpoint the RAT if the conditional branch has pending operands
+    // (if it resolves at issue, no speculative instructions will ever issue behind it)
+    wire issue_wait0      = (i_dec_rs1 != 5'd0) && pending0;
+    wire issue_wait1      = (i_dec_rs2 != 5'd0) && pending1;
+    wire issue_ctrl_ready = issue_ctrl && !issue_wait0 && !issue_wait1;
+    wire issue_ctrl_wait  = issue_ctrl && (issue_wait0 || issue_wait1);
+    wire ckpt_save = issue && !terminal && i_dec_branch && issue_ctrl_wait;
+
     rat #(.ZERO_REG(1)) rat_0 (.i_clk(i_clk), .i_rst(i_rst), .i_rs1_addr(i_dec_rs1), .o_rs1_busy(busy0), .o_rs1_tag(tag0), .i_rs2_addr(i_dec_rs2), .o_rs2_busy(busy1), .o_rs2_tag(tag1), .i_rs3_addr(5'd0), .o_rs3_busy(), .o_rs3_tag(), .i_rename_en(issue && wi), .i_rename_rd(i_dec_rd), .i_rename_tag(tail), .i_commit_en(commit && iw[head]), .i_commit_rd(rd[head]), .i_commit_tag(head), .i_flush(1'b0), .i_ckpt_save(ckpt_save), .i_ckpt_restore(mispred), .o_busy());
     rat #(.ZERO_REG(0)) rat_1 (.i_clk(i_clk), .i_rst(i_rst), .i_rs1_addr(i_dec_frs1_addr), .o_rs1_busy(busy2), .o_rs1_tag(tag2), .i_rs2_addr(i_dec_frs2_addr), .o_rs2_busy(busy3), .o_rs2_tag(tag3), .i_rs3_addr(i_dec_frs3_addr), .o_rs3_busy(busy4), .o_rs3_tag(tag4), .i_rename_en(issue && wf), .i_rename_rd(i_dec_rd), .i_rename_tag(tail), .i_commit_en(commit && fw[head]), .i_commit_rd(rd[head]), .i_commit_tag(head), .i_flush(1'b0), .i_ckpt_save(ckpt_save), .i_ckpt_restore(mispred), .o_busy());
     assign icount = {3'b0,irs[0]} + {3'b0,irs[1]} + {3'b0,irs[2]} + {3'b0,irs[3]} + {3'b0,irs[4]} + {3'b0,irs[5]} + {3'b0,irs[6]} + {3'b0,irs[7]};
@@ -256,36 +276,66 @@ module ooo_core (
     wire ig, fg0, fg1, lg;
     wire [2:0] ix = ia ? it : intpick;
     wire [31:0] ar; wire ab, ae, al;
-    wire istart = intfound && !ia && (!iv || ig);
+
+    // [EBR+BP] Block ALU dispatch on a mispredict flush cycle (just like fstart)
+    wire istart = intfound && !mispred && !ia && (!iv || ig);
     alu integer_alu(.i_clk(i_clk),.i_rst(i_rst),.i_opsel(opcode[ix]),.i_sub(subop[ix]),.i_unsigned(aluuns[ix]),.i_arith(arith[ix]),.i_mext((ia || istart) && mext[ix]),.i_advance(ia && !ab),.i_op1(op1[ix] ? pc[ix] : v0[ix]),.i_op2(op2[ix] ? imm[ix] : v1[ix]),.o_result(ar),.o_eq(ae),.o_slt(al),.o_busy(ab));
     wire execute = (ia || istart) && !ab;
-    wire signed_lt = (v0[ix][31] != v1[ix][31]) ?
-                 v0[ix][31] : (v0[ix] < v1[ix]);
-    wire unsigned_lt = v0[ix] < v1[ix];
-    wire branch_cmp = eqmode[ix] ? (v0[ix] == v1[ix]) :
-                    (bunsigned[ix] ? unsigned_lt : signed_lt);
-    wire take = jump[ix] || (branch[ix] &&
-                (branch_cmp != invert[ix]));
-    wire [31:0] target = pcsel[ix] ? ((v0[ix]+imm[ix]) & 32'hfffffffe) : pc[ix]+imm[ix];
-    wire badtarget = take && target[1:0] != 0;
 
-    // [BP] resolve: compare the actual next pc with the one fetch followed.
-    // Covers wrong direction, wrong target and unpredicted jumps (pred = pc+4).
-    wire        resolve_br = execute && (branch[ix] || jump[ix]);
-    wire [31:0] act_npc    = take ? target : pc[ix] + 32'd4;
-    wire [31:0] prd_npc    = ppred[ix] ? ptgt[ix] : pc[ix] + 32'd4;
-    assign mispred   = resolve_br && !badtarget && (act_npc != prd_npc);
-    assign o_taken   = mispred;
-    assign o_pc_jump = act_npc;
+// [EBR+BP] 1. Issue-time fast path: resolve ready branches/jumps immediately at issue
+    wire [31:0] iss_v0          = (i_dec_rs1 != 5'd0) ? source0 : 32'd0;
+    wire [31:0] iss_v1          = (i_dec_rs2 != 5'd0) ? source1 : 32'd0;
+    wire        iss_signed_lt   = (iss_v0[31] != iss_v1[31]) ? iss_v0[31] : (iss_v0 < iss_v1);
+    wire        iss_unsigned_lt = iss_v0 < iss_v1;
+    wire        iss_branch_cmp  = i_dec_branch_equal ? (iss_v0 == iss_v1) :
+                                  (i_dec_branch_unsigned ? iss_unsigned_lt : iss_signed_lt);
+    wire        iss_take        = i_dec_jump || (i_dec_branch && (iss_branch_cmp != i_dec_branch_invert));
+    wire [31:0] iss_target      = i_dec_pc_sel ? ((iss_v0 + i_dec_imm) & 32'hfffffffe) : (i_id_pc + i_dec_imm);
+    wire        iss_badtarget   = iss_take && (iss_target[1:0] != 2'b00);
+    wire        iss_fire        = issue && issue_ctrl_ready;
+    wire [31:0] iss_act_npc     = iss_take ? iss_target : (i_id_pc + 32'd4);
+    wire [31:0] iss_prd_npc     = (i_id_pred_taken && i_dec_branch) ? i_id_pred_target : (i_id_pc + 32'd4);
+    wire        iss_mispred     = iss_fire && !iss_badtarget && (iss_act_npc != iss_prd_npc);
 
-    // [BP] predictor update (conditional branches only; no BTB fill on a trap)
-    assign o_bp_upd_valid  = execute && branch[ix] && !badtarget;
-    assign o_bp_upd_pc     = pc[ix];
-    assign o_bp_upd_taken  = take;
-    assign o_bp_upd_target = target;
+    // [EBR+BP] 2. Dedicated branch resolver: wakes up on the SAME cycle CDB broadcasts operands
+    wire        br_w0_cdb       = wait0[br_tag] && cv && (q0[br_tag] == ct);
+    wire        br_w0_trap      = wait0[br_tag] && commit && trap[head] && (q0[br_tag] == head);
+    wire        br_w1_cdb       = wait1[br_tag] && cv && (q1[br_tag] == ct);
+    wire        br_w1_trap      = wait1[br_tag] && commit && trap[head] && (q1[br_tag] == head);
+    wire        br_rdy0         = !wait0[br_tag] || br_w0_cdb || br_w0_trap;
+    wire        br_rdy1         = !wait1[br_tag] || br_w1_cdb || br_w1_trap;
+    wire        br_fire         = br_valid && br_rdy0 && br_rdy1;
 
-    // [BP] age of the resolving branch; entries with a larger age are younger
-    wire [2:0] bage = ix - head;
+    wire [31:0] br_v0           = br_w0_cdb ? cd : br_w0_trap ? trap_i_value : v0[br_tag];
+    wire [31:0] br_v1           = br_w1_cdb ? cd : br_w1_trap ? trap_i_value : v1[br_tag];
+    wire        br_signed_lt    = (br_v0[31] != br_v1[31]) ? br_v0[31] : (br_v0 < br_v1);
+    wire        br_unsigned_lt  = br_v0 < br_v1;
+    wire        br_cmp          = eqmode[br_tag] ? (br_v0 == br_v1) :
+                                  (bunsigned[br_tag] ? br_unsigned_lt : br_signed_lt);
+    wire        br_take         = jump[br_tag] || (branch[br_tag] && (br_cmp != invert[br_tag]));
+    wire [31:0] br_target       = pcsel[br_tag] ? ((br_v0 + imm[br_tag]) & 32'hfffffffe) : (pc[br_tag] + imm[br_tag]);
+    wire        br_badtarget    = br_take && (br_target[1:0] != 2'b00);
+    wire [31:0] br_act_npc      = br_take ? br_target : (pc[br_tag] + 32'd4);
+    wire [31:0] br_prd_npc      = ppred[br_tag] ? ptgt[br_tag] : (pc[br_tag] + 32'd4);
+
+    // [EBR+BP] Backend flush (`mispred`) only needed for the dedicated slot (issue-time has no younger ROB entries)
+    // Frontend redirect (`o_taken`) fires for BOTH dedicated-slot and issue-time mispredicts
+    assign mispred   = br_fire && !br_badtarget && (br_act_npc != br_prd_npc);
+    assign o_taken   = mispred || iss_mispred;
+    assign o_pc_jump = mispred ? br_act_npc : iss_act_npc;
+
+    // [EBR+BP] Train dynamic branch predictor from BOTH resolution paths
+    wire br_bp_upd  = br_fire  && branch[br_tag] && !br_badtarget;
+    wire iss_bp_upd = iss_fire && i_dec_branch   && !iss_badtarget;
+    assign o_bp_upd_valid  = br_bp_upd || iss_bp_upd;
+    assign o_bp_upd_pc     = br_bp_upd ? pc[br_tag] : i_id_pc;
+    assign o_bp_upd_taken  = br_bp_upd ? br_take    : iss_take;
+    assign o_bp_upd_target = br_bp_upd ? br_target  : iss_target;
+
+    // [EBR+BP] Age of the resolving branch in the dedicated slot; also detect younger ALU ops to squash
+    wire [2:0] bage     = br_tag - head;
+    wire [2:0] it_age   = it - head;
+    wire       kill_int = mispred && (ia || iv) && (it_age > bage);
 
     reg [1:0] fa, fv;
     reg [2:0] ft[0:1]; reg [31:0] fd[0:1];
@@ -356,24 +406,38 @@ module ooo_core (
     assign o_retire_frs1_raddr = addr2[head]; assign o_retire_frs1_rdata = v2[head];
     assign o_retire_frs2_raddr = addr3[head]; assign o_retire_frs2_rdata = v3[head];
     assign o_retire_frs3_raddr = addr4[head]; assign o_retire_frs3_rdata = v4[head];
+
     always @(posedge i_clk) begin
-        if(i_rst) begin head<=0; tail<=0; count<=0; ctrl<=0; cbr_inflight<=0; ia<=0; iv<=0; lv<=0; end
+        if(i_rst) begin 
+            head<=0; tail<=0; count<=0; ctrl<=0; cbr_inflight<=0; ia<=0; iv<=0; lv<=0; 
+            // [EBR+BP] Reset dedicated branch slot
+            br_valid<=1'b0; br_tag<=3'd0;
+        end
         else begin
             case ({issue,commit}) 2'b10: count<=count+1'b1; 2'b01: count<=count-1'b1; default: count<=count; endcase
             if(commit) head<=head+1'b1;
             if(issue) begin
                 tail<=tail+1'b1;
-                // [BP] jumps serialize issue as before; branches only mark "speculating"
-                if(!terminal && i_dec_jump) ctrl<=1;
-                if(!terminal && i_dec_branch) cbr_inflight<=1;
+                // [EBR+BP] Only set ctrl/cbr_inflight & load dedicated slot if operands are pending
+                if(issue_ctrl_wait) begin
+                    br_valid<=1'b1;
+                    br_tag<=tail;
+                    if(i_dec_jump) ctrl<=1'b1;
+                    if(i_dec_branch) cbr_inflight<=1'b1;
+                end
             end
-            if(execute && jump[ix]) ctrl<=0;
-            if(execute && branch[ix]) cbr_inflight<=0;
+            // [EBR+BP] Clear dedicated slot and in-flight flags as soon as branch/jump resolves
+            if(br_fire) begin
+                br_valid<=1'b0;
+                if(jump[br_tag]) ctrl<=1'b0;
+                if(branch[br_tag]) cbr_inflight<=1'b0;
+            end
             if(ig) iv<=0;
             if(istart) begin it<=ix; ia<=ab; end
             if(execute) begin
                 ia<=0;
-                iv<=!badtarget;
+                // [EBR+BP] Branches/jumps no longer execute on the ALU
+                iv<=1'b1;
                 it<=ix;
                 idata<=branch[ix] ? 0 : jump[ix] ? pc[ix]+4 :
                     lui[ix] ? imm[ix] : ar;
@@ -381,12 +445,13 @@ module ooo_core (
             if(lg) lv<=0;
             if(ldreq && !lg) begin lv<=1; lt<=mx; ld<=lddata; end
 
-            // [BP] mispredict flush (these must stay last so they win):
-            // the ROB keeps everything up to and including the branch
+            // [EBR+BP] Mispredict flush (kept last so it wins): keep ROB up to br_tag
             if(mispred) begin
-                tail  <= ix + 3'd1;
+                tail  <= br_tag + 3'd1;
                 count <= {1'b0,bage} + 4'd1 - {3'b0,commit};
             end
+            // [EBR+BP] Squash any younger speculative ALU or load op on mispredict
+            if(kill_int) begin ia<=1'b0; iv<=1'b0; end
             if(kill_lv || kill_ldreq) lv<=0;
         end
     end
@@ -419,14 +484,15 @@ module ooo_core (
                 if(commit && head==k) begin live[k]<=0; lsu[k]<=0; end
                 if(istart && ix==k) irs[k]<=0;
                 if((|fstart) && fppick==k) frs[k]<=0;
-                if(execute && ix==k) begin
-                    npc[k]<=take && !badtarget ? target : pc[k]+4;
-                    if(badtarget) begin
-                        trap[k]<=1;
-                        done[k]<=1;
-                        result[k]<=32'd0;
-                    end
+                
+                // [EBR+BP] Dedicated branch slot writes npc, link result, done, and trap
+                if(br_fire && br_tag==k) begin
+                    done[k]<=1'b1;
+                    npc[k]<=(br_take && !br_badtarget) ? br_target : (pc[k]+32'd4);
+                    result[k]<=(jump[k] && !br_badtarget) ? (pc[k]+32'd4) : 32'd0;
+                    if(br_badtarget) trap[k]<=1'b1;
                 end
+
                 if(cv && ct==k) begin done[k]<=1; result[k]<=cd; if(lg) lsu[k]<=0; end
                 if(ldreq && mx==k) memraw[k]<=i_dcache_rdata;
                 if(memfound && mx==k && ready[k]) begin
@@ -447,9 +513,21 @@ module ooo_core (
                 if(live[k] && wait4[k] && cv && q4[k]==ct) begin wait4[k]<=0; v4[k]<=cd; end
                 if(live[k] && wait4[k] && commit && trap[head] && q4[k]==head) begin wait4[k]<=0; v4[k]<=trap_f_value; end
                 if(issue && tail==k) begin
-                    live[k]<=1; done[k]<=terminal; trap[k]<=!i_dec_legal; halt[k]<=i_dec_halt;
-                    irs[k]<=!terminal && !ismem && !isfp; frs[k]<=!terminal && isfp; lsu[k]<=!terminal && ismem;
-                    inst[k]<=i_id_inst; pc[k]<=i_id_pc; npc[k]<=i_id_pc+4; imm[k]<=i_dec_imm; rd[k]<=i_dec_rd; flags[k]<=0; result[k]<=0; memraw[k]<=0;
+                    
+                    // [EBR+BP] Ready branches/jumps complete immediately at issue; never enter `irs`
+                    live[k]<=1'b1;
+                    done[k]<=terminal || issue_ctrl_ready;
+                    trap[k]<=!i_dec_legal || (issue_ctrl_ready && iss_badtarget);
+                    halt[k]<=i_dec_halt;
+                    irs[k]<=!terminal && !ismem && !isfp && !issue_ctrl;
+                    frs[k]<=!terminal && isfp;
+                    lsu[k]<=!terminal && ismem;
+                    inst[k]<=i_id_inst; pc[k]<=i_id_pc;
+                    npc[k]<=(issue_ctrl_ready && iss_take && !iss_badtarget) ? iss_target : (i_id_pc+32'd4);
+                    imm[k]<=i_dec_imm; rd[k]<=i_dec_rd; flags[k]<=0;
+                    result[k]<=(issue_ctrl_ready && i_dec_jump && !iss_badtarget) ? (i_id_pc+32'd4) : 32'd0;
+                    memraw[k]<=0;
+                    
                     iw[k]<=wi; fw[k]<=wf; lui[k]<=i_dec_rd_sel[1]; opcode[k]<=i_dec_alu_opsel;
 
                     load[k]<=i_dec_dmem_ren;
