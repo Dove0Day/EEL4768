@@ -25,41 +25,26 @@ module imm (
 
     reg [31:0] immediate; // placeholder for what type it is
 
-    always @(*) begin
-        case (i_format)
-            6'b000001: immediate = 32'b0; // R-type
+    // phase 4: one wire per format
+    wire [31:0] imm_i;
+    wire [31:0] imm_s;
+    wire [31:0] imm_b;
+    wire [31:0] imm_u;
+    wire [31:0] imm_j;
 
-            6'b000010:
-                immediate = {{20{i_inst[31]}}, i_inst[31:20]}; // I-type
+   // phase 4: assign immediates by type
+   assign imm_i = {{20{i_inst[31]}}, i_inst[31:20]}; // I type
+   assign imm_s = {{20{i_inst[31]}}, i_inst[31:25], i_inst[11:7]}; // S type
+   assign imm_b = {{19{i_inst[31]}}, i_inst[31], i_inst[7], i_inst[30:25], i_inst[11:8], 1'b0}; // B type
+   assign imm_u = {i_inst[31:12], 12'b0}; // U type
+   assign imm_b = {{11{i_inst[31]}}, i_inst[31], i_inst[19:12], i_inst[20], i_inst[30:21], 1'b0}; // J type
 
-            6'b000100:
-                immediate = {{20{i_inst[31]}},
-                            i_inst[31:25],
-                            i_inst[11:7]}; // S-type
-
-            6'b001000:
-                immediate = {{19{i_inst[31]}},
-                            i_inst[31],
-                            i_inst[7],
-                            i_inst[30:25],
-                            i_inst[11:8],
-                            1'b0}; // B-type
-
-            6'b010000:
-                immediate = {i_inst[31:12], 12'b0}; // U-type
-
-            6'b100000:
-                immediate = {{11{i_inst[31]}},
-                            i_inst[31],
-                            i_inst[19:12],
-                            i_inst[20],
-                            i_inst[30:21],
-                            1'b0}; // J-type
-
-            default:
-                immediate = 32'b0;
-        endcase
-    end
-
-    assign o_immediate = immediate; //assigns the immediate to the output
+   // phase 4: select by corresponding bit fields per type
+    assign o_immediate = 
+        (i_format == 6'b000010) ? imm_i :
+        (i_format == 6'b000100) ? imm_s :
+        (i_format == 6'b001000) ? imm_b :
+        (i_format == 6'b010000) ? imm_u :
+        (i_format == 6'b100000) ? imm_j : 32'b0;
+        
 endmodule //imm
