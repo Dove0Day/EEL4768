@@ -288,13 +288,12 @@ module alu (
     wire [31:0] op1_mag=start_op1_neg?op1_twos:i_op1;
     wire [31:0] op2_mag=start_op2_neg?op2_twos:i_op2;
 
-    // Shift-and-add multiplier datapath and final-step look-ahead
-    wire [63:0] product_add; wire [64:0] product_c; assign product_c[0]=1'b0;
-    generate for(n=0;n<64;n=n+1) begin: PRODUCT_ADD
-        assign product_add[n]=prod_reg[n]^multiplicand[n]^product_c[n];
-        assign product_c[n+1]=(prod_reg[n]&multiplicand[n])|(prod_reg[n]&product_c[n])|(multiplicand[n]&product_c[n]);
-    end endgenerate
-    wire [63:0] product_step=multiplier[0]?product_add:prod_reg;
+    // Extra credit: shift-and-add multiplier, 4 multiplier bits per cycle
+    wire [63:0] mul_pp0=multiplier[0]?multiplicand:64'd0;
+    wire [63:0] mul_pp1=multiplier[1]?{multiplicand[62:0],1'b0}:64'd0;
+    wire [63:0] mul_pp2=multiplier[2]?{multiplicand[61:0],2'b0}:64'd0;
+    wire [63:0] mul_pp3=multiplier[3]?{multiplicand[60:0],3'b0}:64'd0;
+    wire [63:0] product_step=prod_reg+mul_pp0+mul_pp1+mul_pp2+mul_pp3;
 
     // Negate the completed product when exactly one signed operand was negative
     wire [63:0] product_inv;
@@ -307,21 +306,32 @@ module alu (
     end endgenerate
     wire [63:0] corrected_product=m_prod_neg?product_twos:product_step;
 
-    // Restoring divider
-    // The subtraction carry-out implements the unsigned comparison, and the full 33-bit remainder is retained
-    wire [32:0] rem_shift={rem_reg[31:0],dividend_reg[31]};
+    // Extra credit: restoring divider, 4 quotient bits per cycle
+    // each stage shifts in a dividend bit and subtracts the divisor if it fits
+    wire [33:0] div_d={2'b0,divisor_reg};
 
-    // Invert the complete 33-bit zero-extended divisor for subtraction
-    wire [32:0] div_b={1'b1,~divisor_reg}; wire [32:0] rem_sub; wire [33:0] rem_c; assign rem_c[0]=1'b1;
-    generate for(n=0;n<33;n=n+1) begin: REM_SUB
-        assign rem_sub[n]=rem_shift[n]^div_b[n]^rem_c[n];
-        assign rem_c[n+1]=(rem_shift[n]&div_b[n])|(rem_shift[n]&rem_c[n])|(div_b[n]&rem_c[n]);
-    end endgenerate
+    wire [32:0] rem_sh0={rem_reg[31:0],dividend_reg[31]};
+    wire [33:0] rem_df0={1'b0,rem_sh0}-div_d;
+    wire        q0=~rem_df0[33];
+    wire [32:0] rem_s0=q0?rem_df0[32:0]:rem_sh0;
 
-    wire rem_ge=rem_c[33]; wire [32:0] rem_step=rem_ge?rem_sub:rem_shift;
+    wire [32:0] rem_sh1={rem_s0[31:0],dividend_reg[30]};
+    wire [33:0] rem_df1={1'b0,rem_sh1}-div_d;
+    wire        q1=~rem_df1[33];
+    wire [32:0] rem_s1=q1?rem_df1[32:0]:rem_sh1;
 
-    // Append the comparison result to the quotient: 1 if subtraction succeeded
-    wire [31:0] quot_step={quot_reg[30:0],rem_ge};
+    wire [32:0] rem_sh2={rem_s1[31:0],dividend_reg[29]};
+    wire [33:0] rem_df2={1'b0,rem_sh2}-div_d;
+    wire        q2=~rem_df2[33];
+    wire [32:0] rem_s2=q2?rem_df2[32:0]:rem_sh2;
+
+    wire [32:0] rem_sh3={rem_s2[31:0],dividend_reg[28]};
+    wire [33:0] rem_df3={1'b0,rem_sh3}-div_d;
+    wire        q3=~rem_df3[33];
+    wire [32:0] rem_step=q3?rem_df3[32:0]:rem_sh3;
+
+    // append the 4 new quotient bits
+    wire [31:0] quot_step={quot_reg[27:0],q0,q1,q2,q3};
 
     // Convert quotient and remainder back to signed results when needed
     wire [31:0] quot_inv;
@@ -359,9 +369,9 @@ module alu (
             end else if(state==S_BUSY) begin
                 if(m_is_div) begin
                     // Perform one restoring-division iteration
-                    rem_reg<=rem_step; quot_reg<=quot_step; dividend_reg<={dividend_reg[30:0],1'b0};
+                    rem_reg<=rem_step; quot_reg<=quot_step; dividend_reg<={dividend_reg[27:0],4'b0};
 
-                    if(step_cnt==5'd31) begin state<=S_DONE;
+                    if(step_cnt==5'd7) begin state<=S_DONE;
                         // Select the final quotient or remainder, applying signed correction and the defined exceptional results
                         if(m_opsel==3'b100) mext_result<=m_div_zero?32'hffffffff:(m_div_overflow?32'h80000000:corrected_quot);
                         else if(m_opsel==3'b101) mext_result<=m_div_zero?32'hffffffff:quot_step;
@@ -369,11 +379,11 @@ module alu (
                         else mext_result<=m_div_zero?original_dividend:rem_step[31:0];
                     end
                 end else begin
-                    prod_reg<=product_step; multiplicand<={multiplicand[62:0],1'b0}; multiplier<={1'b0,multiplier[31:1]};
+                    prod_reg<=product_step; multiplicand<={multiplicand[59:0],4'b0}; multiplier<={4'b0,multiplier[31:4]};
                     
                     // Return the low product for MUL
                     // or the high product portion for the high-half multiply operations
-                    if(step_cnt==5'd31) begin state<=S_DONE; mext_result<=(m_opsel==3'b000)?corrected_product[31:0]:corrected_product[63:32]; end
+                    if(step_cnt==5'd7) begin state<=S_DONE; mext_result<=(m_opsel==3'b000)?corrected_product[31:0]:corrected_product[63:32]; end
                 end
                 step_cnt<=next_step; // Advance the iteration count once per busy cycle.
             end else if(state==S_DONE) begin
@@ -390,4 +400,4 @@ module alu (
     assign o_busy=i_mext&&(state!=S_DONE);
     assign o_result=i_mext?mext_result:rv32i_result;
 endmodule
-`default_nettype wire
+`default_nettype wire
