@@ -6,21 +6,14 @@
 // multiply/divide unit, and decodes the details of its own instructions from
 // the instruction word.
 //
-// It owns all F-extension state: fcsr, holding the dynamic rounding mode frm
-// (fcsr[7:5]) and the accrued exception flags fflags (fcsr[4:0] = NV DZ OF
-// UF NX). Floating-point exceptions never trap; they only set flags, which
-// stay set until software clears them through a CSR instruction.
-//
-// fcsr only changes on a rising edge where the instruction in execute
-// actually moves on to the memory stage (`i_advance`). An instruction can sit
-// in execute for several cycles (for example while a cache miss freezes the
-// pipeline); committing its flags or CSR write on every one of those cycles
-// would make a CSR instruction read back its own write.
+// fcsr is shared by both FP units and maintained by the ROB.
+// Each unit returns the flags raised by its own instruction, not the accrued
+// flags. The ROB applies CSR writes and accumulates flags in retirement order
+// so a younger or squashed instruction cannot change architectural state.
 module fpu (
     // Global clock.
     input  wire        i_clk,
-    // Synchronous active-high reset. Clears fcsr (frm = round to nearest,
-    // ties to even; no flags set).
+    // Synchronous active-high reset. Clears the local execution state.
     input  wire        i_rst,
     // The instruction word in the execute stage.
     input  wire [31:0] i_inst,
@@ -29,7 +22,7 @@ module fpu (
     // instruction and the CSR instructions on fflags/frm/fcsr.
     input  wire        i_valid,
     // Asserted when the instruction in execute advances to the memory stage
-    // on the next rising edge. Side effects (fcsr updates) happen only then.
+    // on the next rising edge. Releases the held arithmetic result.
     input  wire        i_advance,
     // Floating-point source operands (rs1, rs2, rs3), raw IEEE bit patterns.
     input  wire [31:0] i_frs1,
@@ -43,8 +36,8 @@ module fpu (
     // Result for instructions that write an integer register: fmv.x.w,
     // fclass.s, feq/flt/fle.s, fcvt.w[u].s, and the old CSR value.
     output wire [31:0] o_int_result,
-    // The accrued exception flags as they will be after this instruction
-    // (reported in the retire trace).
+    // exception flags raised by this instruction (NV, DZ, OF, UF, NX)
+    // the ROB accumulates these flags when the instruction retires.
     output wire [ 4:0] o_fflags,
     // Asserted while a multi-cycle operation (fdiv.s/fsqrt.s) is in
     // progress and the instruction must stay in execute.
@@ -76,8 +69,8 @@ module fpu (
     wire [6:0] funct7 = i_inst[31:25];
     wire [11:0] csr_addr = i_inst[31:20];
 
-    // Floating-point control and status state
-    // accrued_flags contains NV, DZ, OF, UF, and NX, frm stores the rounding mode
+    // shared fcsr is owned by the ROB, both FP lanes read the same state
+    // only retirement updates frm and accrued exception flags
     wire [4:0] accrued_flags = i_shared_flags;
     wire [2:0] frm = i_shared_frm;
 
@@ -207,12 +200,15 @@ module fpu (
     reg [31:0] class_result;
     always @(*) begin
         case ({a_nan, a_snan, a_inf, a_zero, a_exp_zero, i_frs1[31]})
-            6'b110000: class_result = 32'h0000_0100;
-            6'b100000: class_result = 32'h0000_0200;
+            6'b110000, 6'b110001:
+                class_result = 32'h0000_0100;
+
+            6'b100000, 6'b100001:
+                class_result = 32'h0000_0200;
             6'b001001: class_result = 32'h0000_0001;
             6'b001000: class_result = 32'h0000_0080;
-            6'b000101: class_result = 32'h0000_0008;
-            6'b000100: class_result = 32'h0000_0010;
+            6'b000111: class_result = 32'h0000_0008;
+            6'b000110: class_result = 32'h0000_0010;
             6'b000011: class_result = 32'h0000_0004;
             6'b000010: class_result = 32'h0000_0020;
             6'b000001: class_result = 32'h0000_0002;
@@ -398,22 +394,58 @@ module fpu (
     // ---------------------------------------------------------------------
     // Form and normalize the significand product, adjusting the exponent for operand denormals, product magnitude, and any subnormal result.
     wire fmul_sign = i_frs1[31] ^ i_frs2[31];
-    wire [8:0] fmul_exp_sum = {1'b0,(a_exp_zero ? 8'd1 : i_frs1[30:23])} +
-                              {1'b0,(b_exp_zero ? 8'd1 : i_frs2[30:23])};
-    // product_sum[24] is the exact structural 24x24 product declared above.
-    wire [47:0] fmul_product = significand_product;
-    wire fmul_top = fmul_product[47];
-    wire [8:0] fmul_exp_pre = fmul_exp_sum - 9'd127 + {8'd0,fmul_top};
-    wire [47:0] fmul_norm_product = fmul_top ? fmul_product :
-                                     {fmul_product[46:0],1'b0};
+        wire [9:0] fmul_exp_sum =
+        {2'b0,(a_exp_zero ? 8'd1 : i_frs1[30:23])} +
+        {2'b0,(b_exp_zero ? 8'd1 : i_frs2[30:23])};
 
-    // If the unbiased result exponent is below the normal range, shift the exact product right into the subnormal range while retaining sticky
-    wire fmul_subnormal = fmul_exp_pre[8] || (fmul_exp_pre == 9'd0);
-    wire [8:0] fmul_sub_shift_full = fmul_exp_pre[8] ?
-                                      (9'd1 - fmul_exp_pre) :
-                                      ((fmul_exp_pre == 9'd0) ? 9'd1 : 9'd0);
-    wire [5:0] fmul_sub_shift = (fmul_sub_shift_full > 9'd47) ?
-                                 6'd47 : fmul_sub_shift_full[5:0];
+    wire [47:0] fmul_product = significand_product;
+
+    // Normalize the full 48-bit product.
+        wire fmul_n32 = ~|fmul_product[47:16];
+    wire [47:0] fmul_p32 = fmul_n32 ?
+        {fmul_product[15:0],32'd0} : fmul_product;
+
+    wire fmul_n16 = ~|fmul_p32[47:32];
+    wire [47:0] fmul_p16 = fmul_n16 ?
+        {fmul_p32[31:0],16'd0} : fmul_p32;
+
+    wire fmul_n8 = ~|fmul_p16[47:40];
+    wire [47:0] fmul_p8 = fmul_n8 ?
+        {fmul_p16[39:0],8'd0} : fmul_p16;
+
+    wire fmul_n4 = ~|fmul_p8[47:44];
+    wire [47:0] fmul_p4 = fmul_n4 ?
+        {fmul_p8[43:0],4'd0} : fmul_p8;
+
+    wire fmul_n2 = ~|fmul_p4[47:46];
+    wire [47:0] fmul_p2 = fmul_n2 ?
+        {fmul_p4[45:0],2'd0} : fmul_p4;
+
+    wire fmul_n1 = ~fmul_p2[47];
+
+    wire [47:0] fmul_norm_product = fmul_n1 ?
+        {fmul_p2[46:0],1'b0} : fmul_p2;
+
+    wire [5:0] fmul_lz =
+        {fmul_n32,fmul_n16,fmul_n8,
+         fmul_n4,fmul_n2,fmul_n1};
+
+    wire [9:0] fmul_exp_pre =
+        fmul_exp_sum - 10'd126 -
+        {4'd0,fmul_lz};
+
+    wire fmul_subnormal =
+        fmul_exp_pre[9] ||
+        (fmul_exp_pre == 10'd0);
+
+    wire [9:0] fmul_sub_shift_full =
+        fmul_subnormal ?
+        (10'd1 - fmul_exp_pre) : 10'd0;
+
+    wire [5:0] fmul_sub_shift =
+        (fmul_sub_shift_full > 10'd63) ?
+        6'd63 : fmul_sub_shift_full[5:0];
+
     wire [63:0] fmul_shift_input = {fmul_norm_product,16'd0};
     wire [63:0] fmul_shift_1 = fmul_sub_shift[0] ?
         {1'b0,fmul_shift_input[63:2],|fmul_shift_input[1:0]} : fmul_shift_input;
@@ -433,7 +465,9 @@ module fpu (
                                      fmul_shifted[63:16] : fmul_norm_product;
     wire [23:0] fmul_retained = fmul_round_source[47:24];
     wire fmul_guard = fmul_round_source[23];
-    wire fmul_sticky = |fmul_round_source[22:0];
+    wire fmul_sticky =
+        (|fmul_round_source[22:0]) ||
+        (fmul_subnormal && (|fmul_shifted[15:0]));
     wire fmul_inexact = fmul_guard | fmul_sticky;
     wire fmul_round_up =
         (selected_rm == 3'b000) ? (fmul_guard && (fmul_sticky || fmul_retained[0])) :
@@ -444,13 +478,16 @@ module fpu (
     wire [24:0] fmul_rounded = {1'b0,fmul_retained} + {24'd0,fmul_round_up};
     wire [23:0] fmul_sig_final = fmul_rounded[24] ?
                                   fmul_rounded[24:1] : fmul_rounded[23:0];
-    wire [8:0] fmul_exp_after_round = fmul_subnormal ?
-        ((fmul_rounded[24] || fmul_sig_final[23]) ? 9'd1 : 9'd0) :
-        (fmul_exp_pre + {8'd0,fmul_rounded[24]});
+    wire [9:0] fmul_exp_after_round =
+        fmul_subnormal ?
+            ((fmul_rounded[24] ||
+            fmul_sig_final[23]) ? 10'd1 : 10'd0) :
+            (fmul_exp_pre + {9'd0,fmul_rounded[24]});
 
 
     // Pack the result and select the appropriate overflow value and flags
-    wire fmul_overflow = fmul_exp_after_round >= 9'd255;
+    wire fmul_overflow =
+        fmul_exp_after_round >= 10'd255;
     wire fmul_to_inf = (selected_rm == 3'b000) || (selected_rm == 3'b100) ||
                        ((selected_rm == 3'b010) && fmul_sign) ||
                        ((selected_rm == 3'b011) && !fmul_sign);
@@ -460,8 +497,9 @@ module fpu (
         {fmul_sign,fmul_exp_after_round[7:0],fmul_sig_final[22:0]};
     wire [4:0] fmul_finite_flags =
         {1'b0,1'b0,fmul_overflow,
-         (fmul_subnormal && fmul_inexact),
-         (fmul_inexact || fmul_overflow)};
+        ((fmul_exp_after_round == 10'd0) &&
+        fmul_inexact),
+        (fmul_inexact || fmul_overflow)};
 
 
     // ---------------------------------------------------------------------
@@ -565,32 +603,125 @@ module fpu (
         end
     endgenerate
 
-    // Extract quotient and remainder rounding bits, then round the signed result
-    wire [26:0] fdiv_q = fdiv_qbit[26:0];
-    wire [23:0] fdiv_retained = fdiv_q[25:2];
-    wire fdiv_guard = fdiv_q[1];
-    wire fdiv_sticky = fdiv_q[0] | (|fdiv_rem[50]);
-    wire fdiv_inexact = fdiv_guard | fdiv_sticky;
-    wire fdiv_sign = i_frs1[31]^i_frs2[31];
+    //
+    // Division exponent before rounding
+    wire [11:0] fdiv_exp_pre =
+        {1'b0,unbiased_a} -
+        {1'b0,unbiased_b} +
+        12'd127 -
+        {11'd0,fdiv_scale_num};
+
+    wire fdiv_sign = i_frs1[31] ^ i_frs2[31];
+
+    wire fdiv_subnormal =
+        fdiv_exp_pre[11] ||
+        (fdiv_exp_pre == 12'd0);
+
+    wire [11:0] fdiv_sub_shift_full =
+        fdiv_subnormal ?
+        (12'd1 - fdiv_exp_pre) : 12'd0;
+
+    wire [4:0] fdiv_sub_shift =
+        (fdiv_sub_shift_full > 12'd31) ?
+        5'd31 : fdiv_sub_shift_full[4:0];
+
+    // Preserve quotient and remainder information
+    wire [31:0] fdiv_q =
+        {6'd0,fdiv_qbit[25:1],
+         (fdiv_qbit[0] | (|fdiv_rem[50]))};
+
+    // Constant-stage right shift with sticky bit
+    wire [31:0] fdiv_d1 =
+        fdiv_sub_shift[0] ?
+        {1'b0,fdiv_q[31:2],|fdiv_q[1:0]} :
+        fdiv_q;
+
+    wire [31:0] fdiv_d2 =
+        fdiv_sub_shift[1] ?
+        {2'b0,fdiv_d1[31:3],|fdiv_d1[2:0]} :
+        fdiv_d1;
+
+    wire [31:0] fdiv_d4 =
+        fdiv_sub_shift[2] ?
+        {4'b0,fdiv_d2[31:5],|fdiv_d2[4:0]} :
+        fdiv_d2;
+
+    wire [31:0] fdiv_d8 =
+        fdiv_sub_shift[3] ?
+        {8'b0,fdiv_d4[31:9],|fdiv_d4[8:0]} :
+        fdiv_d4;
+
+    wire [31:0] fdiv_round_input =
+        fdiv_sub_shift[4] ?
+        {16'b0,fdiv_d8[31:17],|fdiv_d8[16:0]} :
+        fdiv_d8;
+
+    wire [23:0] fdiv_retained =
+        fdiv_round_input[25:2];
+
+    wire fdiv_guard = fdiv_round_input[1];
+    wire fdiv_sticky = fdiv_round_input[0];
+
+    wire fdiv_inexact =
+        fdiv_guard | fdiv_sticky;
+
+    // All five rounding modes
     wire fdiv_round_up =
-        (selected_rm==3'b000) ? (fdiv_guard&&(fdiv_sticky||fdiv_retained[0])) :
-        (selected_rm==3'b001) ? 1'b0 :
-        (selected_rm==3'b010) ? (fdiv_sign&&fdiv_inexact) :
-        (selected_rm==3'b011) ? (!fdiv_sign&&fdiv_inexact) :
-        (selected_rm==3'b100) ? fdiv_guard : 1'b0;
-    wire [24:0] fdiv_rounded = {1'b0,fdiv_retained}+{24'd0,fdiv_round_up};
-    wire [23:0] fdiv_sig_final = fdiv_rounded[24] ? fdiv_rounded[24:1] : fdiv_rounded[23:0];
-    wire [11:0] fdiv_biased = {1'b0,unbiased_a}-{1'b0,unbiased_b}+
-        12'd127-{11'd0,fdiv_scale_num}+{11'd0,fdiv_rounded[24]};
-    wire fdiv_overflow = fdiv_biased >= 12'd255;
-    wire fdiv_underflow = fdiv_biased[11] || (fdiv_biased == 12'd0);
-    wire fdiv_to_inf = (selected_rm==3'b000)||(selected_rm==3'b100)||
-        ((selected_rm==3'b010)&&fdiv_sign)||((selected_rm==3'b011)&&!fdiv_sign);
-    wire [31:0] fdiv_finite_result = fdiv_overflow ?
-        (fdiv_to_inf?{fdiv_sign,8'hff,23'd0}:{fdiv_sign,8'hfe,23'h7fffff}) :
-        (fdiv_underflow?{fdiv_sign,31'd0}:{fdiv_sign,fdiv_biased[7:0],fdiv_sig_final[22:0]});
-    wire [4:0] fdiv_finite_flags = {1'b0,1'b0,fdiv_overflow,
-        (fdiv_underflow&&fdiv_inexact),(fdiv_inexact||fdiv_overflow||fdiv_underflow)};
+        (selected_rm == 3'b000) ?
+            (fdiv_guard &&
+             (fdiv_sticky || fdiv_retained[0])) :
+        (selected_rm == 3'b010) ?
+            (fdiv_sign && fdiv_inexact) :
+        (selected_rm == 3'b011) ?
+            (!fdiv_sign && fdiv_inexact) :
+        (selected_rm == 3'b100) ?
+            fdiv_guard : 1'b0;
+
+    wire [24:0] fdiv_rounded =
+        {1'b0,fdiv_retained} +
+        {24'd0,fdiv_round_up};
+
+    wire [23:0] fdiv_sig_final =
+        fdiv_rounded[24] ?
+        fdiv_rounded[24:1] :
+        fdiv_rounded[23:0];
+
+    // A rounded subnormal may become normal
+    wire [11:0] fdiv_biased =
+        fdiv_subnormal ?
+            {11'd0,fdiv_rounded[23]} :
+            (fdiv_exp_pre +
+             {11'd0,fdiv_rounded[24]});
+
+    wire fdiv_overflow =
+        !fdiv_biased[11] &&
+        (fdiv_biased >= 12'd255);
+
+    // Tininess detected after rounding
+    wire fdiv_underflow =
+        (fdiv_biased == 12'd0) &&
+        fdiv_inexact;
+
+    wire fdiv_to_inf =
+        (selected_rm == 3'b000) ||
+        (selected_rm == 3'b100) ||
+        ((selected_rm == 3'b010) && fdiv_sign) ||
+        ((selected_rm == 3'b011) && !fdiv_sign);
+
+    wire [31:0] fdiv_finite_result =
+        fdiv_overflow ?
+            (fdiv_to_inf ?
+                {fdiv_sign,8'hff,23'd0} :
+                {fdiv_sign,8'hfe,23'h7fffff}) :
+            {fdiv_sign,
+             fdiv_biased[7:0],
+             fdiv_sig_final[22:0]};
+
+    wire [4:0] fdiv_finite_flags =
+        {1'b0,1'b0,fdiv_overflow,
+         fdiv_underflow,
+         (fdiv_inexact || fdiv_overflow)};
+
 
     // Digit-by-digit square root
     // The radicand is scaled so the 27-bit root contains 24 retained bits plus guard/round/sticky information
@@ -675,18 +806,28 @@ module fpu (
     wire [11:0] fused_exp_c=c_exp_zero?
         (12'd130-{7'd0,fused_lz_c}):
         ({4'd0,i_frs3[30:23]}+12'd129);
-    wire fused_prod_top=significand_product[47];
-    wire [47:0] fused_prod_norm=fused_prod_top?significand_product:
+    wire fused_prod_top = significand_product[47];
+    wire [47:0] fused_prod_norm = fused_prod_top ?
+        significand_product :
         {significand_product[46:0],1'b0};
     wire [11:0] fused_exp_prod =
-        {1'b0,unbiased_a}+{1'b0,unbiased_b}-12'd256+
+        {1'b0,unbiased_a} +
+        {1'b0,unbiased_b} -
+        12'd256 +
+        {7'd0,norm_lz_a} +
+        {7'd0,norm_lz_b} +
         {11'd0,fused_prod_top};
     wire fused_prod_sign=i_frs1[31]^i_frs2[31]^
         ((opcode==OPC_NMSUB)||(opcode==OPC_NMADD));
     wire fused_c_sign=i_frs3[31]^
         ((opcode==OPC_MSUB)||(opcode==OPC_NMADD));
-    wire fused_prod_ge_c=(fused_exp_prod>fused_exp_c) ||
-        ((fused_exp_prod==fused_exp_c) && ({fused_prod_norm,16'd0}>={fused_sig_c,40'd0}));
+        wire fused_prod_zero = a_zero || b_zero;
+    wire fused_prod_ge_c = c_zero ||
+        (!fused_prod_zero &&
+            ((fused_exp_prod > fused_exp_c) ||
+            ((fused_exp_prod == fused_exp_c) &&
+            ({fused_prod_norm,16'd0} >=
+            {fused_sig_c,40'd0}))));
     wire [11:0] fused_exp_large=fused_prod_ge_c?fused_exp_prod:fused_exp_c;
     wire [11:0] fused_exp_small=fused_prod_ge_c?fused_exp_c:fused_exp_prod;
     wire [63:0] fused_mag_large=fused_prod_ge_c?{fused_prod_norm,16'd0}:{fused_sig_c,40'd0};
@@ -791,31 +932,113 @@ module fpu (
     wire [63:0] fused_n16=fused_lz[4]?{fused_n8[47:0],16'b0}:fused_n8;
     wire [63:0] fused_norm=fused_lz[5]?{fused_n16[31:0],32'b0}:fused_n16;
     wire [12:0] fused_exp_norm=fused_exp_pre-{7'd0,fused_lz};
-    wire [23:0] fused_keep=fused_norm[63:40];
-    wire fused_guard=fused_norm[39];
-    wire fused_sticky=|fused_norm[38:0];
-    wire fused_inexact=fused_guard|fused_sticky;
-    wire fused_round_up=(selected_rm==3'b000)?(fused_guard&&(fused_sticky||fused_keep[0])):
-        (selected_rm==3'b001)?1'b0:
-        (selected_rm==3'b010)?(fused_sign_large&&fused_inexact):
-        (selected_rm==3'b011)?(!fused_sign_large&&fused_inexact):
-        (selected_rm==3'b100)?fused_guard:1'b0;
-    wire [24:0] fused_rounded={1'b0,fused_keep}+{24'd0,fused_round_up};
-    wire [23:0] fused_sig_final=fused_rounded[24]?fused_rounded[24:1]:fused_rounded[23:0];
-    wire [13:0] fused_biased={1'b0,fused_exp_norm}-14'd129+
-        {13'd0,fused_rounded[24]};
-    wire fused_zero=~|fused_sum_ext;
-    wire fused_overflow=fused_biased>=14'd255;
-    wire fused_underflow=fused_biased[13] || (fused_biased==14'd0);
-    wire fused_to_inf=(selected_rm==3'b000)||(selected_rm==3'b100)||
-        ((selected_rm==3'b010)&&fused_sign_large)||((selected_rm==3'b011)&&!fused_sign_large);
-    wire [31:0] fused_finite_result=fused_zero?{(selected_rm==3'b010),31'd0}:
-        (fused_overflow?(fused_to_inf?{fused_sign_large,8'hff,23'd0}:
-         {fused_sign_large,8'hfe,23'h7fffff}):
-         (fused_underflow?{fused_sign_large,31'd0}:
-          {fused_sign_large,fused_biased[7:0],fused_sig_final[22:0]}));
-    wire [4:0] fused_finite_flags={1'b0,1'b0,fused_overflow,
-        (fused_underflow&&fused_inexact),(fused_inexact||fused_overflow||fused_underflow)};
+
+    // Shift into the subnormal range before rounding.
+    wire fused_tiny_pre = fused_exp_norm < 13'd130;
+
+    wire [12:0] fused_denorm_full =
+        fused_tiny_pre ?
+        (13'd130 - fused_exp_norm) : 13'd0;
+
+    wire [5:0] fused_denorm_shift =
+        (fused_denorm_full > 13'd63) ?
+        6'd63 : fused_denorm_full[5:0];
+
+    wire [63:0] fused_d1 = fused_denorm_shift[0] ?
+        {1'b0,fused_norm[63:2],|fused_norm[1:0]} :
+        fused_norm;
+
+    wire [63:0] fused_d2 = fused_denorm_shift[1] ?
+        {2'b0,fused_d1[63:3],|fused_d1[2:0]} :
+        fused_d1;
+
+    wire [63:0] fused_d4 = fused_denorm_shift[2] ?
+        {4'b0,fused_d2[63:5],|fused_d2[4:0]} :
+        fused_d2;
+
+    wire [63:0] fused_d8 = fused_denorm_shift[3] ?
+        {8'b0,fused_d4[63:9],|fused_d4[8:0]} :
+        fused_d4;
+
+    wire [63:0] fused_d16 = fused_denorm_shift[4] ?
+        {16'b0,fused_d8[63:17],|fused_d8[16:0]} :
+        fused_d8;
+
+    wire [63:0] fused_round_input =
+        fused_denorm_shift[5] ?
+        {32'b0,fused_d16[63:33],|fused_d16[32:0]} :
+        fused_d16;
+
+    wire [23:0] fused_keep = fused_round_input[63:40];
+    wire fused_guard = fused_round_input[39];
+    wire fused_sticky = |fused_round_input[38:0];
+
+    wire fused_inexact = fused_guard | fused_sticky;
+
+    wire fused_round_up =
+        (selected_rm == 3'b000) ?
+            (fused_guard &&
+             (fused_sticky || fused_keep[0])) :
+        (selected_rm == 3'b010) ?
+            (fused_sign_large && fused_inexact) :
+        (selected_rm == 3'b011) ?
+            (!fused_sign_large && fused_inexact) :
+        (selected_rm == 3'b100) ?
+            fused_guard : 1'b0;
+
+    wire [24:0] fused_rounded =
+        {1'b0,fused_keep} +
+        {24'd0,fused_round_up};
+
+    wire [23:0] fused_sig_final =
+        fused_rounded[24] ?
+        fused_rounded[24:1] :
+        fused_rounded[23:0];
+
+    wire [13:0] fused_biased =
+        fused_tiny_pre ?
+            {13'd0,fused_rounded[23]} :
+            ({1'b0,fused_exp_norm} - 14'd129 +
+             {13'd0,fused_rounded[24]});
+
+    wire fused_zero = ~|fused_sum_ext;
+
+    wire fused_zero_sign =
+        (fused_prod_sign == fused_c_sign) ?
+        fused_prod_sign :
+        (selected_rm == 3'b010);
+
+    wire fused_overflow =
+        !fused_zero &&
+        (fused_biased >= 14'd255);
+
+    wire fused_underflow =
+        !fused_zero &&
+        (fused_biased == 14'd0) &&
+        fused_inexact;
+
+    wire fused_to_inf =
+        (selected_rm == 3'b000) ||
+        (selected_rm == 3'b100) ||
+        ((selected_rm == 3'b010) && fused_sign_large) ||
+        ((selected_rm == 3'b011) && !fused_sign_large);
+
+    wire [31:0] fused_finite_result =
+        fused_zero ?
+            {fused_zero_sign,31'd0} :
+        fused_overflow ?
+            (fused_to_inf ?
+                {fused_sign_large,8'hff,23'd0} :
+                {fused_sign_large,8'hfe,23'h7fffff}) :
+            {fused_sign_large,
+             fused_biased[7:0],
+             fused_sig_final[22:0]};
+
+    wire [4:0] fused_finite_flags =
+        {1'b0,1'b0,fused_overflow,
+         fused_underflow,
+         (!fused_zero &&
+          (fused_inexact || fused_overflow))};
 
     // Integer-to-float conversion
     // Signed conversion first forms a magnitude
@@ -880,116 +1103,143 @@ module fpu (
          (cvt_i_rounded[24]?cvt_i_rounded[23:1]:cvt_i_rounded[22:0])};
     wire [4:0] cvt_s_w_flags={4'd0,cvt_i_inexact};
 
-// Float-to-integer conversion
-wire cvt_w_unsigned = rs2_field[0];
+    // Float-to-integer conversion
+    wire cvt_w_unsigned = rs2_field[0];
+    wire cvt_w_neg = i_frs1[31];
 
-wire [7:0] cvt_w_exp = i_frs1[30:23];
-wire cvt_w_neg = i_frs1[31];
+    wire [7:0] cvt_w_exp =
+        a_exp_zero ? 8'd1 : i_frs1[30:23];
 
-wire [7:0] cvt_w_rdist = 8'd150 - cvt_w_exp;
-wire [7:0] cvt_w_ldist = cvt_w_exp - 8'd150;
+    wire cvt_w_shift_negative =
+        cvt_w_exp < 8'd150;
 
-// Preserve fractional bits for rounding.
-wire [63:0] cvt_w_base = {16'd0, sig_a, 24'd0};
+    wire [7:0] cvt_w_shift_magnitude =
+        cvt_w_shift_negative ?
+        (8'd150 - cvt_w_exp) :
+        (cvt_w_exp - 8'd150);
 
-wire [63:0] cvt_w_r1 = cvt_w_rdist[0] ?
-    (cvt_w_base >> 1) : cvt_w_base;
-wire [63:0] cvt_w_r2 = cvt_w_rdist[1] ?
-    (cvt_w_r1 >> 2) : cvt_w_r1;
-wire [63:0] cvt_w_r4 = cvt_w_rdist[2] ?
-    (cvt_w_r2 >> 4) : cvt_w_r2;
-wire [63:0] cvt_w_r8 = cvt_w_rdist[3] ?
-    (cvt_w_r4 >> 8) : cvt_w_r4;
-wire [63:0] cvt_w_r16 = cvt_w_rdist[4] ?
-    (cvt_w_r8 >> 16) : cvt_w_r8;
-wire [63:0] cvt_w_r32 = cvt_w_rdist[5] ?
-    (cvt_w_r16 >> 32) : cvt_w_r16;
+    // Reserve separate guard and sticky bits.
+    wire [63:0] cvt_w_base =
+        {38'd0, sig_a, 2'b00};
 
-wire [63:0] cvt_w_right =
-    (cvt_w_rdist >= 8'd24) ? 64'd0 : cvt_w_r32;
+    wire [5:0] cvt_w_rshift =
+        (cvt_w_shift_magnitude > 8'd63) ?
+        6'd63 : cvt_w_shift_magnitude[5:0];
 
-wire [63:0] cvt_w_lbase = {40'd0, sig_a};
+    wire [63:0] cvt_w_right_1 =
+        cvt_w_rshift[0] ?
+        {1'b0,cvt_w_base[63:2],
+         |cvt_w_base[1:0]} : cvt_w_base;
 
-wire [63:0] cvt_w_l1 = cvt_w_ldist[0] ?
-    (cvt_w_lbase << 1) : cvt_w_lbase;
-wire [63:0] cvt_w_l2 = cvt_w_ldist[1] ?
-    (cvt_w_l1 << 2) : cvt_w_l1;
-wire [63:0] cvt_w_l4 = cvt_w_ldist[2] ?
-    (cvt_w_l2 << 4) : cvt_w_l2;
-wire [63:0] cvt_w_l8 = cvt_w_ldist[3] ?
-    (cvt_w_l4 << 8) : cvt_w_l4;
-wire [63:0] cvt_w_l16 = cvt_w_ldist[4] ?
-    (cvt_w_l8 << 16) : cvt_w_l8;
+    wire [63:0] cvt_w_right_2 =
+        cvt_w_rshift[1] ?
+        {2'b0,cvt_w_right_1[63:3],
+         |cvt_w_right_1[2:0]} : cvt_w_right_1;
 
-wire [63:0] cvt_w_mag =
-    (cvt_w_exp < 8'd127) ? 64'd0 :
-    (cvt_w_exp < 8'd150) ?
-        {24'd0, cvt_w_right[63:24]} :
-    (cvt_w_ldist >= 8'd32) ?
-        64'hffffffffffffffff : cvt_w_l16;
+    wire [63:0] cvt_w_right_4 =
+        cvt_w_rshift[2] ?
+        {4'b0,cvt_w_right_2[63:5],
+         |cvt_w_right_2[4:0]} : cvt_w_right_2;
 
-wire cvt_w_guard =
-    (cvt_w_exp == 8'd126) ? 1'b1 :
-    (cvt_w_exp < 8'd126) ? 1'b0 :
-    (cvt_w_exp < 8'd150) ?
-        cvt_w_right[23] : 1'b0;
+    wire [63:0] cvt_w_right_8 =
+        cvt_w_rshift[3] ?
+        {8'b0,cvt_w_right_4[63:9],
+         |cvt_w_right_4[8:0]} : cvt_w_right_4;
 
-wire cvt_w_sticky =
-    (cvt_w_exp < 8'd126) ? !a_zero :
-    (cvt_w_exp == 8'd126) ? |i_frs1[22:0] :
-    (cvt_w_exp < 8'd150) ?
-        |cvt_w_right[22:0] : 1'b0;
+    wire [63:0] cvt_w_right_16 =
+        cvt_w_rshift[4] ?
+        {16'b0,cvt_w_right_8[63:17],
+         |cvt_w_right_8[16:0]} : cvt_w_right_8;
 
-wire cvt_w_inexact = cvt_w_guard | cvt_w_sticky;
+    wire [63:0] cvt_w_shifted_right =
+        cvt_w_rshift[5] ?
+        {32'b0,cvt_w_right_16[63:33],
+         |cvt_w_right_16[32:0]} : cvt_w_right_16;
 
-// RNE, RTZ, RDN, RUP, RMM.
-wire cvt_w_round_up =
-    (selected_rm == 3'b000) ?
-        (cvt_w_guard &&
-         (cvt_w_sticky || cvt_w_mag[0])) :
-    (selected_rm == 3'b001) ? 1'b0 :
-    (selected_rm == 3'b010) ?
-        (cvt_w_neg && cvt_w_inexact) :
-    (selected_rm == 3'b011) ?
-        (!cvt_w_neg && cvt_w_inexact) :
-    (selected_rm == 3'b100) ?
-        cvt_w_guard : 1'b0;
+    // Constant-stage left barrel shifter.
+    wire [63:0] cvt_w_left_1 =
+        cvt_w_shift_magnitude[0] ?
+        {cvt_w_base[62:0],1'b0} : cvt_w_base;
 
-wire [63:0] cvt_w_rounded =
-    cvt_w_mag + {63'd0, cvt_w_round_up};
+    wire [63:0] cvt_w_left_2 =
+        cvt_w_shift_magnitude[1] ?
+        {cvt_w_left_1[61:0],2'b0} : cvt_w_left_1;
 
-wire cvt_w_invalid =
-    a_nan || a_inf ||
-    (cvt_w_exp > 8'd158) ||
-    (cvt_w_unsigned ?
-        ((cvt_w_neg && (cvt_w_rounded != 64'd0)) ||
-         (cvt_w_rounded > 64'h00000000ffffffff)) :
-        (cvt_w_neg ?
-         (cvt_w_rounded > 64'h0000000080000000) :
-         (cvt_w_rounded > 64'h000000007fffffff)));
+    wire [63:0] cvt_w_left_4 =
+        cvt_w_shift_magnitude[2] ?
+        {cvt_w_left_2[59:0],4'b0} : cvt_w_left_2;
 
-wire [31:0] cvt_w_signed_mag =
-    cvt_w_rounded[31:0];
+    wire [63:0] cvt_w_left_8 =
+        cvt_w_shift_magnitude[3] ?
+        {cvt_w_left_4[55:0],8'b0} : cvt_w_left_4;
 
-wire [31:0] cvt_w_signed_value =
-    cvt_w_neg ?
-    (~cvt_w_signed_mag + 32'd1) :
-    cvt_w_signed_mag;
+    wire [63:0] cvt_w_left_16 =
+        cvt_w_shift_magnitude[4] ?
+        {cvt_w_left_8[47:0],16'b0} : cvt_w_left_8;
 
-wire [31:0] cvt_w_result =
-    cvt_w_invalid ?
+    wire [63:0] cvt_w_left_32 =
+        cvt_w_shift_magnitude[5] ?
+        {cvt_w_left_16[31:0],32'b0} : cvt_w_left_16;
+
+    wire [63:0] cvt_w_shifted =
+        cvt_w_shift_negative ?
+        cvt_w_shifted_right : cvt_w_left_32;
+
+    wire [61:0] cvt_w_keep =
+        cvt_w_shifted[63:2];
+
+    wire cvt_w_guard = cvt_w_shifted[1];
+    wire cvt_w_sticky = cvt_w_shifted[0];
+
+    wire cvt_w_inexact =
+        cvt_w_guard | cvt_w_sticky;
+
+    // All five rounding modes.
+    wire cvt_w_round =
+        (selected_rm == 3'b000) ?
+            (cvt_w_guard &&
+             (cvt_w_sticky || cvt_w_keep[0])) :
+        (selected_rm == 3'b010) ?
+            (cvt_w_neg && cvt_w_inexact) :
+        (selected_rm == 3'b011) ?
+            (!cvt_w_neg && cvt_w_inexact) :
+        (selected_rm == 3'b100) ?
+            cvt_w_guard : 1'b0;
+
+    wire [62:0] cvt_w_mag =
+        {1'b0,cvt_w_keep} +
+        {62'd0,cvt_w_round};
+
+    // Range check after rounding.
+    wire cvt_w_invalid =
+        a_nan || a_inf ||
+        (cvt_w_exp > 8'd158) ||
         (cvt_w_unsigned ?
-            ((cvt_w_neg && !a_nan) ?
-                32'd0 : 32'hffffffff) :
-            ((cvt_w_neg && !a_nan) ?
-                32'h80000000 : 32'h7fffffff)) :
-        cvt_w_signed_value;
+            ((cvt_w_neg && (cvt_w_mag != 63'd0)) ||
+             (cvt_w_mag > 63'h00000000ffffffff)) :
+            (cvt_w_neg ?
+                (cvt_w_mag > 63'h0000000080000000) :
+                (cvt_w_mag > 63'h000000007fffffff)));
 
-wire [4:0] cvt_w_flags =
-    {cvt_w_invalid, 3'd0,
-     (!cvt_w_invalid && cvt_w_inexact)};
+    wire [31:0] cvt_w_signed_value =
+        cvt_w_neg ?
+        (~cvt_w_mag[31:0] + 32'd1) :
+        cvt_w_mag[31:0];
 
-    
+    wire [31:0] cvt_w_result =
+        cvt_w_invalid ?
+            (cvt_w_unsigned ?
+                ((cvt_w_neg && !a_nan) ?
+                    32'd0 : 32'hffffffff) :
+                ((cvt_w_neg && !a_nan) ?
+                    32'h80000000 : 32'h7fffffff)) :
+            cvt_w_signed_value;
+
+    wire [4:0] cvt_w_flags =
+        {cvt_w_invalid, 3'd0,
+         (!cvt_w_invalid && cvt_w_inexact)};
+
+
     // Results and per-instruction flags
     // Arithmetic datapaths use a normalized extended significand
     // Fused path retains the 48-bit product before the addend is aligned, so only the final result is rounded.
@@ -1025,19 +1275,52 @@ wire [4:0] cvt_w_flags =
                 int_result_comb = csr_old;
             end
             OPC_MADD, OPC_MSUB, OPC_NMSUB, OPC_NMADD: begin
-                // The exact fused significand product is retained
-                // Special cases are resolved before the finite normalization path
-                case ({a_nan|b_nan|c_nan, (a_inf&&b_zero)||(a_zero&&b_inf), a_snan|b_snan|c_snan})
-                    3'b001, 3'b011, 3'b101, 3'b111: begin
+                case ({a_nan|b_nan|c_nan,
+                    (a_inf&&b_zero)||(a_zero&&b_inf),
+                    a_snan|b_snan|c_snan})
+
+                    3'b001, 3'b010, 3'b011,
+                    3'b101, 3'b110, 3'b111: begin
                         fp_result_comb = CANONICAL_NAN;
                         instruction_flags[4] = 1'b1;
                     end
-                    3'b100, 3'b110: fp_result_comb = CANONICAL_NAN;
-                    3'b010: begin fp_result_comb = CANONICAL_NAN; instruction_flags[4] = 1'b1; end
+
+                    3'b100: begin
+                        fp_result_comb = CANONICAL_NAN;
+                    end
+
                     default: begin
-                        // Finite fused datapath result is produced by shared arithmetic sequencer below
-                        fp_result_comb = fused_finite_result;
-                        instruction_flags = fused_finite_flags;
+                        case ({a_inf|b_inf, c_inf})
+
+                            2'b11: begin
+                                case (fused_prod_sign ^ fused_c_sign)
+                                    1'b1: begin
+                                        fp_result_comb = CANONICAL_NAN;
+                                        instruction_flags[4] = 1'b1;
+                                    end
+
+                                    default: begin
+                                        fp_result_comb =
+                                            {fused_prod_sign,8'hff,23'd0};
+                                    end
+                                endcase
+                            end
+
+                            2'b10: begin
+                                fp_result_comb =
+                                    {fused_prod_sign,8'hff,23'd0};
+                            end
+
+                            2'b01: begin
+                                fp_result_comb =
+                                    {fused_c_sign,8'hff,23'd0};
+                            end
+
+                            default: begin
+                                fp_result_comb = fused_finite_result;
+                                instruction_flags = fused_finite_flags;
+                            end
+                        endcase
                     end
                 endcase
             end
@@ -1055,8 +1338,13 @@ wire [4:0] cvt_w_flags =
                             3'b110,3'b111: fp_result_comb = CANONICAL_NAN;
                             3'b100,3'b101: fp_result_comb = i_frs2;
                             3'b010,3'b011: fp_result_comb = i_frs1;
-                            3'b000: fp_result_comb = fp_less ? i_frs1 : i_frs2;
-                            default: fp_result_comb = fp_less ? i_frs2 : i_frs1;
+                            3'b000: fp_result_comb = both_zero ?
+                                {i_frs1[31] | i_frs2[31], 31'd0} :
+                                (fp_less ? i_frs1 : i_frs2);
+
+                            default: fp_result_comb = both_zero ?
+                                {i_frs1[31] & i_frs2[31], 31'd0} :
+                                (fp_less ? i_frs2 : i_frs1);
                         endcase
                         instruction_flags[4] = a_snan || b_snan;
                     end
@@ -1088,7 +1376,12 @@ wire [4:0] cvt_w_flags =
                         case ({a_nan|b_nan, a_snan|b_snan,
                                a_inf&&b_inf&&(i_frs1[31]^(i_frs2[31]^(funct7==7'b0000100)))})
                             3'b001,3'b011,3'b101,3'b111: begin fp_result_comb=CANONICAL_NAN; instruction_flags[4]=1'b1; end
-                            3'b100,3'b110: fp_result_comb=CANONICAL_NAN;
+                            3'b100: fp_result_comb = CANONICAL_NAN;
+
+                            3'b110: begin
+                                fp_result_comb = CANONICAL_NAN;
+                                instruction_flags[4] = 1'b1;
+                            end
                             3'b010: begin fp_result_comb=CANONICAL_NAN; instruction_flags[4]=1'b1; end
                             default: fp_result_comb = a_inf ? i_frs1 :
                                 (b_inf ? {i_frs2[31]^(funct7==7'b0000100),i_frs2[30:0]} :
@@ -1103,7 +1396,11 @@ wire [4:0] cvt_w_flags =
                     7'b0001000: begin
                         case ({a_nan|b_nan, a_snan|b_snan, (a_inf&&b_zero)||(a_zero&&b_inf)})
                             3'b001,3'b011,3'b101,3'b111: begin fp_result_comb=CANONICAL_NAN; instruction_flags[4]=1'b1; end
-                            3'b100,3'b110: fp_result_comb=CANONICAL_NAN;
+                            3'b100: fp_result_comb = CANONICAL_NAN;
+                            3'b110: begin
+                                fp_result_comb = CANONICAL_NAN;
+                                instruction_flags[4] = 1'b1;
+                            end
                             3'b010: begin fp_result_comb=CANONICAL_NAN; instruction_flags[4]=1'b1; end
                             default: fp_result_comb = (a_inf||b_inf) ? {i_frs1[31]^i_frs2[31],8'hff,23'd0} :
                                 ((a_zero||b_zero) ? {i_frs1[31]^i_frs2[31],31'd0} : fmul_finite_result);
@@ -1122,8 +1419,15 @@ wire [4:0] cvt_w_flags =
                             4'b0010,4'b0011: begin fp_result_comb=CANONICAL_NAN; instruction_flags[4]=1'b1; end
                             4'b0100,4'b0101,4'b0110,4'b0111: begin fp_result_comb=CANONICAL_NAN; instruction_flags[4]=1'b1; end
                             4'b1000,4'b1001,4'b1010,4'b1011: fp_result_comb=CANONICAL_NAN;
-                            default: fp_result_comb = a_inf ? {i_frs1[31]^i_frs2[31],8'hff,23'd0} :
-                                (b_inf ? {i_frs1[31]^i_frs2[31],31'd0} : fdiv_finite_result);
+                            4'b1100, 4'b1101, 4'b1110, 4'b1111: begin
+                                fp_result_comb = CANONICAL_NAN;
+                                instruction_flags[4] = 1'b1;
+                            end
+                            default: fp_result_comb = a_inf ?
+                                {i_frs1[31]^i_frs2[31],8'hff,23'd0} :
+                                ((b_inf || a_zero) ?
+                                    {i_frs1[31]^i_frs2[31],31'd0} :
+                                    fdiv_finite_result);
                         endcase
                         case ({a_nan|b_nan,a_inf|b_inf,a_zero|b_zero})
                             3'b000: instruction_flags=fdiv_finite_flags;
@@ -1132,28 +1436,36 @@ wire [4:0] cvt_w_flags =
                     end
                     7'b0101100: begin
                         case ({a_nan,a_snan,i_frs1[31],a_zero})
-                            4'b0100,4'b0101,4'b0110,4'b0111: begin fp_result_comb=CANONICAL_NAN; instruction_flags[4]=1'b1; end
-                            4'b1000,4'b1001,4'b1010,4'b1011: fp_result_comb=CANONICAL_NAN;
-                            4'b0010: begin fp_result_comb=CANONICAL_NAN; instruction_flags[4]=1'b1; end
-                            default: fp_result_comb = a_zero ? i_frs1 : sqrt_finite_result;
-                        endcase
-                        case ({a_nan,a_inf,i_frs1[31],a_zero})
-                            4'b0000: instruction_flags=sqrt_finite_flags;
-                            default: instruction_flags=instruction_flags;
-                        endcase
-                    end
-                    7'b1100000: begin
-                        // Float-to-integer saturation and exact common cases
-                        case ({a_nan,a_inf,i_frs1[31],rs2_field[0]})
-                            4'b1000,4'b1010,4'b0100: begin int_result_comb=32'h7fff_ffff; instruction_flags[4]=1'b1; end
-                            4'b1001,4'b0101: begin int_result_comb=32'hffff_ffff; instruction_flags[4]=1'b1; end
-                            4'b0110: begin int_result_comb=32'h8000_0000; instruction_flags[4]=1'b1; end
-                            4'b0011: begin int_result_comb=32'd0; instruction_flags[4]=1'b1; end
+                            4'b1100, 4'b1110: begin
+                                fp_result_comb = CANONICAL_NAN;
+                                instruction_flags = 5'b10000;
+                            end
+
+                            4'b1000, 4'b1010: begin
+                                fp_result_comb = CANONICAL_NAN;
+                            end
+
+                            4'b0010: begin
+                                fp_result_comb = CANONICAL_NAN;
+                                instruction_flags = 5'b10000;
+                            end
+
+                            4'b0001, 4'b0011: begin
+                                fp_result_comb = i_frs1;
+                            end
+
                             default: begin
-                                int_result_comb = cvt_w_result;
-                                instruction_flags = cvt_w_flags;
+                                fp_result_comb = a_inf ?
+                                    i_frs1 : sqrt_finite_result;
+
+                                instruction_flags = a_inf ?
+                                    5'd0 : sqrt_finite_flags;
                             end
                         endcase
+end
+                    7'b1100000: begin
+                        int_result_comb = cvt_w_result;
+                        instruction_flags = cvt_w_flags;
                     end
                     7'b1101000: begin
                         fp_result_comb = cvt_s_w_result;
@@ -1214,6 +1526,7 @@ wire [4:0] cvt_w_flags =
     assign o_busy = i_valid && long_operation && !o_rm_trap && (state != ST_DONE);
     assign o_fp_result = (state == ST_DONE) ? held_fp_result : fp_result_comb;
     assign o_int_result = (state == ST_DONE) ? held_int_result : int_result_comb;
+    // return only this instruction's flags, CSR writes are handled at commit
     assign o_fflags =
         ((state == ST_DONE) ? held_flags : (i_valid && !is_csr ? instruction_flags : 5'd0));
 

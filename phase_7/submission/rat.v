@@ -41,6 +41,7 @@ module rat #(
 
     // busy bits are reset, tags only matter while busy
     reg  [31:0]      busy_q;
+    // each busy register points to its most recent unretired writer
     reg  [TAG_W-1:0] tag_q [0:31];
 
     // x0 is never renamed in the integer RAT
@@ -57,6 +58,7 @@ module rat #(
     // next busy bits: flush clears, rename sets (wins over commit), commit clears
     wire [31:0] busy_next;
 
+    // generate one busy-bit update circuit for each architectural register
     genvar g;
     generate
         for (g = 0; g < 32; g = g + 1) begin : gen_busy
@@ -73,6 +75,7 @@ module rat #(
         end
     endgenerate
 
+    // reset only the busy bits, stale tags are ignored when not busy
     // table update
     always @(posedge i_clk) begin
         if (i_rst) begin
@@ -94,6 +97,7 @@ module rat #(
     assign rs2_zero = (ZERO_REG != 0) && (i_rs2_addr == 5'd0);
     assign rs3_zero = (ZERO_REG != 0) && (i_rs3_addr == 5'd0);
 
+    // integer x0 always reads as ready, FP f0 follows the normal busy bit
     assign o_rs1_busy = !rs1_zero && busy_q[i_rs1_addr];
     assign o_rs2_busy = !rs2_zero && busy_q[i_rs2_addr];
     assign o_rs3_busy = !rs3_zero && busy_q[i_rs3_addr];
