@@ -131,7 +131,9 @@ module riscv_fv (
     .o_rs1_busy(o_rs1_busy),
     .o_rs1_tag(o_rs1_tag),
     .o_rs2_busy(o_rs2_busy),
-    .o_rs2_tag(o_rs2_tag)
+    .o_rs2_tag(o_rs2_tag),
+    .i_ckpt_save    (1'b0),
+    .i_ckpt_restore (1'b0)
   );
 
 `ifdef FORMAL

@@ -91,35 +91,60 @@ module rat #(
         end
     endgenerate
 
-    integer k;
+    // Checkpoint busy-bit update
     always @(posedge i_clk) begin
         if (i_rst) begin
             ckpt_busy_q <= 32'b0;
         end
         else if (i_ckpt_save) begin
-            ckpt_busy_q <= busy_next;   // includes this cycle's rename/commit
-            for (k = 0; k < 32; k = k + 1)
-                ckpt_tag_q[k] <= (rename_ok && (i_rename_rd == k)) ? i_rename_tag : tag_q[k];
+            ckpt_busy_q <= busy_next;
         end
         else begin
             ckpt_busy_q <= ckpt_busy_commit;
         end
     end
 
-    // table update
+    // Active RAT busy-bit update
     always @(posedge i_clk) begin
         if (i_rst) begin
             busy_q <= 32'b0;
         end
         else begin
-            busy_q <= i_ckpt_restore ? ckpt_busy_commit : busy_next;
-            if (rename_ok && !i_flush)
-                tag_q[i_rename_rd] <= i_rename_tag;
-            if (i_ckpt_restore)
-                for (k = 0; k < 32; k = k + 1)
-                    tag_q[k] <= ckpt_tag_q[k];
+            busy_q <= i_ckpt_restore ?
+                      ckpt_busy_commit : busy_next;
         end
     end
+
+    // Per-register tag save, rename and restore
+    genvar k;
+    generate
+        for (k = 0; k < 32; k = k + 1) begin : gen_tags
+
+            wire rename_here;
+
+            assign rename_here = rename_ok &&
+                                 (i_rename_rd == k[4:0]);
+
+            always @(posedge i_clk) begin
+                if (!i_rst && i_ckpt_save) begin
+                    ckpt_tag_q[k] <= rename_here ?
+                                     i_rename_tag : tag_q[k];
+                end
+            end
+
+            always @(posedge i_clk) begin
+                if (!i_rst) begin
+                    if (i_ckpt_restore) begin
+                        tag_q[k] <= ckpt_tag_q[k];
+                    end
+                    else if (rename_here && !i_flush) begin
+                        tag_q[k] <= i_rename_tag;
+                    end
+                end
+            end
+
+        end
+    endgenerate
 
     // lookups show the table from the start of the cycle
     // (add x1, x1, x2 sees the older producer of x1)

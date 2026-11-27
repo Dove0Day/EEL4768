@@ -189,8 +189,8 @@ module hart #(
 
     // dynamic branch prediction
     // 2-bit BHT + BTB (predicted in IF)
-    localparam BP_IDX_W   = 6;                    // 64 entries
-    localparam BP_ENTRIES = 1 << BP_IDX_W;
+    localparam BP_IDX_W   = 6;
+    localparam BP_ENTRIES = 64;
     localparam BP_TAG_W   = 32 - 2 - BP_IDX_W;
 
     reg [1:0]          bht_q       [0:BP_ENTRIES-1];  // 00 SNT 01 WNT 10 WT 11 ST
@@ -230,27 +230,41 @@ module hart #(
     wire [BP_IDX_W-1:0] bp_upd_idx;
     assign bp_upd_idx = bp_upd_pc[BP_IDX_W+1:2];
 
-    integer bp_i;
-    always @(posedge i_clk) begin
-        if (i_rst) begin
-            for (bp_i = 0; bp_i < BP_ENTRIES; bp_i = bp_i + 1) begin
-                bht_q[bp_i]       <= 2'b01;   // weakly not taken
-                btb_valid_q[bp_i] <= 1'b0;
-            end
-        end else if (bp_upd_valid) begin
-            if (bp_upd_taken) begin
-                if (bht_q[bp_upd_idx] != 2'b11)
-                    bht_q[bp_upd_idx] <= bht_q[bp_upd_idx] + 2'd1;
-                btb_valid_q[bp_upd_idx] <= 1'b1;
-                btb_tag_q[bp_upd_idx]   <= bp_upd_pc[31:BP_IDX_W+2];
-                btb_tgt_q[bp_upd_idx]   <= bp_upd_target;
-            end else if (bht_q[bp_upd_idx] != 2'b00) begin
-                bht_q[bp_upd_idx] <= bht_q[bp_upd_idx] - 2'd1;
+    genvar bp_i;
+    generate
+        for (bp_i = 0; bp_i < BP_ENTRIES;
+             bp_i = bp_i + 1) begin : gen_bp
+
+        localparam [BP_IDX_W-1:0] ENTRY_IDX = bp_i;
+
+        wire update_here;
+
+        assign update_here = bp_upd_valid &&
+                            (bp_upd_idx == ENTRY_IDX);
+
+            always @(posedge i_clk) begin
+                if (i_rst) begin
+                    bht_q[bp_i]       <= 2'b01;
+                    btb_valid_q[bp_i] <= 1'b0;
+                end
+                else if (update_here) begin
+                    if (bp_upd_taken) begin
+                        if (bht_q[bp_i] != 2'b11)
+                            bht_q[bp_i] <= bht_q[bp_i] + 2'd1;
+
+                        btb_valid_q[bp_i] <= 1'b1;
+                        btb_tag_q[bp_i]   <= bp_upd_pc[31:BP_IDX_W+2];
+                        btb_tgt_q[bp_i]   <= bp_upd_target;
+                    end
+                    else if (bht_q[bp_i] != 2'b00) begin
+                        bht_q[bp_i] <= bht_q[bp_i] - 2'd1;
+                    end
+                end
             end
         end
-    end
+    endgenerate
 
-        // ID stage: decoder and register file
+    // ID stage: decoder and register file
 
     wire        dec_legal; // high if instruction encoding is valid
     wire        dec_halt; // high if decoder requests a halt
