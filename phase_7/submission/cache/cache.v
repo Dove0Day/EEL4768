@@ -672,13 +672,19 @@ endgenerate
 // In IDLE, readiness must reflect the current request combinationally.
 // A registered ready value from reset would otherwise let the hart consume
 // rdata_reg (zero) on the first miss before the memory line has arrived.
+// do not accept a store while a prefetch fill owns the cache update path
+// a store miss must wait for an outstanding prefetch before starting a write
 assign o_ready =
     (controller_state == STATE_REFILL)
         ? 1'b1
         : ((controller_state == STATE_IDLE)
-            ? (!(prefetch_outstanding && i_mem_valid) &&
-               (!(i_ren || i_wen) || i_wen || cache_hit))
+            ? (!pf_fill_valid &&
+               !(prefetch_outstanding && i_mem_valid) &&
+               (!(i_ren || i_wen) ||
+                cache_hit ||
+                (i_wen && !prefetch_outstanding)))
             : ready_reg);
+
 
 // request acceptance and memory transaction control
 always @(posedge i_clk) begin
@@ -724,7 +730,10 @@ always @(posedge i_clk) begin
             STATE_IDLE: begin
                 ready_reg <= 1'b1;
 
-                if (prefetch_outstanding && i_mem_valid) begin
+                // hold the request until the prefetch line has been installed
+                if (pf_fill_valid) begin
+                    ready_reg <= 1'b0;
+                end else if (prefetch_outstanding && i_mem_valid) begin
                     // Collision option B: prefetch update has priority.
                     ready_reg <= 1'b0;
                     prefetch_outstanding <= 1'b0;
